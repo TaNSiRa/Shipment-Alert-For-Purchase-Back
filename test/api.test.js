@@ -90,7 +90,7 @@ test("viewer cannot import; import commit creates POs once", async () => {
 test("advance: validation, optimistic step check, re-plan from actual dates", async () => {
   const id = await makePo("T-ADV-1", addDays(todayIso(), -30));
   const before = (await api.buyer.get(`/pos/${id}`)).body.data;
-  assert.equal(before.steps.length, 10);
+  assert.equal(before.steps.length, 9);
   assert.equal(before.steps[0].state, "done");
   assert.equal(before.steps[1].state, "current");
 
@@ -140,19 +140,19 @@ test("bulk advance closes the same step on several POs and reports stale ones", 
 test("full run to completion, then dashboard and monthly report", async () => {
   const start = addDays(todayIso(), -60);
   const id = await makePo("T-FULL-1", start);
-  for (let step = 2; step <= 10; step += 1) {
+  for (let step = 2; step <= 9; step += 1) {
     const r = await api.buyer.post(`/pos/${id}/advance`, { expectedStep: step, actualDate: addDays(start, step * 5) });
     assert.equal(r.status, 200, `step ${step}: ${JSON.stringify(r.body)}`);
   }
   const po = (await api.buyer.get(`/pos/${id}`)).body.data;
   assert.equal(po.status, "COMPLETED");
-  assert.equal(po.currentStep, 11);
+  assert.equal(po.currentStep, 10);
   assert.equal((await api.buyer.post(`/pos/${id}/advance`, {})).status, 400);
 
   const dash = await api.viewer.get("/reports/dashboard");
   assert.equal(dash.status, 200);
   assert.ok(dash.body.counts.active >= 1);
-  assert.equal(dash.body.byStep.length, 9);
+  assert.equal(dash.body.byStep.length, 8);
   assert.equal(dash.body.trend.length, 6);
 
   const month = addDays(start, 45).slice(0, 7);
@@ -228,7 +228,7 @@ test("masters: section admin edits, user cannot, referenced rows cannot be delet
 
 test("workflow edits are validated and re-plan open POs", async () => {
   const wf = (await api.viewer.get("/workflow")).body;
-  assert.equal(wf.steps.length, 10);
+  assert.equal(wf.steps.length, 9);
   const bad = wf.steps.map(s => (s.stepNo === 4 ? { ...s, anchorStepNo: 6 } : s));
   assert.equal((await api.secadmin.put("/workflow", { steps: bad })).status, 400);
   assert.equal((await api.buyer.put("/workflow", { steps: wf.steps })).status, 403);
@@ -359,7 +359,7 @@ test("calendar, roadmap and list filters", async () => {
   assert.ok(Array.isArray(cal.body.events));
   const rm = await api.viewer.get("/pos/roadmap");
   assert.equal(rm.status, 200);
-  assert.ok(rm.body.data.every(p => p.steps.length === 10));
+  assert.ok(rm.body.data.every(p => p.steps.length === 9));
   const overdue = await api.viewer.get("/pos?due=OVERDUE&pageSize=500");
   assert.ok(overdue.body.data.every(p => p.dueState === "overdue"));
   const done = await api.viewer.get("/pos?status=COMPLETED");

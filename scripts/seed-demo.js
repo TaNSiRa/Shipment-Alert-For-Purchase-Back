@@ -87,7 +87,7 @@ async function main() {
   for (const po of pos) {
     const age = diffDays(new Date(po.document_date).toISOString().slice(0, 10), today);
     const r = rand(po.po_no);
-    const stopAt = age > 150 ? (r < 0.55 ? 11 : r < 0.8 ? 10 : 9) : age > 60 ? 5 + Math.floor(r * 4) : 2 + Math.floor(r * 3);
+    const stopAt = age > 150 ? (r < 0.55 ? 10 : r < 0.8 ? 9 : 8) : age > 60 ? 5 + Math.floor(r * 4) : 2 + Math.floor(r * 3);
     for (let step = 2; step < stopAt; step += 1) {
       const detail = (await query("SELECT due_date FROM po_steps WHERE po_id = @id AND step_no = @step", { id: po.id, step })).recordset[0];
       const due = new Date(detail.due_date).toISOString().slice(0, 10);

@@ -4,7 +4,7 @@ const sql = require("mssql");
 const { env } = require("../config/env");
 
 // Creates the database when missing and applies database/schema.sql (which is
-// idempotent), then makes sure every section has its ten workflow steps.
+// idempotent), then makes sure every section has its workflow steps.
 async function initDatabase({ log = console.log } = {}) {
   const base = {
     server: env.sql.server,
@@ -36,6 +36,8 @@ async function initDatabase({ log = console.log } = {}) {
         return req.query(text);
       }
     };
+    const { runMigrations } = require("./migrations");
+    await runMigrations(runner, log);
     const sections = (await pool.request().query("SELECT id FROM sections")).recordset;
     for (const s of sections) await insertDefaultSteps(runner, s.id);
     log(`Workflow steps ensured for ${sections.length} section(s)`);

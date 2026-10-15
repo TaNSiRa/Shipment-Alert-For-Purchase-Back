@@ -13,6 +13,7 @@ const { poListBuffer } = require("../../services/reportService");
 const { emitSection } = require("../../services/realtimeService");
 const { endOfMonth, isIsoDate, todayIso } = require("../../services/dates");
 const { normalizeMaterialCode } = require("../../services/excelKit");
+const { STEP_COUNT } = require("../../services/workflowService");
 
 const router = express.Router();
 router.use(resolveSection);
@@ -284,7 +285,7 @@ router.post("/import/commit", requireEditor, asyncHandler(async (req, res) => {
 }));
 
 const advanceSchema = z.object({
-  expectedStep: z.number().int().min(2).max(10).optional(),
+  expectedStep: z.number().int().min(2).max(STEP_COUNT).optional(),
   actualDate: isoDate.optional(),
   referenceNo: z.string().max(80).optional().nullable(),
   remark: z.string().max(500).optional().nullable()
@@ -305,7 +306,7 @@ router.post("/:id(\\d+)/advance", requireEditor, asyncHandler(async (req, res) =
 router.post("/bulk-advance", requireEditor, asyncHandler(async (req, res) => {
   const input = advanceSchema.extend({
     ids: z.array(z.number().int().positive()).min(1).max(200),
-    expectedStep: z.number().int().min(2).max(10)
+    expectedStep: z.number().int().min(2).max(STEP_COUNT)
   }).parse(req.body);
   const ctx = await loadContext(req.section.id);
   const results = [];

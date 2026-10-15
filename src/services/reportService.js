@@ -113,15 +113,15 @@ async function dashboardSummary(sectionId, ctx) {
   const arrivals = pos
     .filter(p => p.etaDate && p.etaDate >= today && p.currentStep <= arrival)
     .sort((a, b) => a.etaDate.localeCompare(b.etaDate))
-    .slice(0, 8);
+    .slice(0, 5);
   const overdueList = pos
     .filter(p => p.dueState === "overdue")
     .sort((a, b) => b.overdueDays - a.overdueDays)
-    .slice(0, 8);
+    .slice(0, 5);
   const dueSoonList = pos
     .filter(p => p.dueState === "today" || p.dueState === "soon")
     .sort((a, b) => a.nextDueDate.localeCompare(b.nextDueDate))
-    .slice(0, 8);
+    .slice(0, 5);
   return { today, counts, byStep, bySupplier, modes, trend, arrivals, overdueList, dueSoonList };
 }
 
@@ -150,7 +150,7 @@ async function dailyDigest(sectionId, ctx) {
   };
 }
 
-// The month-end summary ("Monthly report" — step 10 of the process).
+// The month-end summary (the Monthly Report page and the month-end email).
 async function monthlyReport(sectionId, month, ctx) {
   const { start, end } = monthRange(month);
   const arrival = arrivalStepNo(ctx.steps);

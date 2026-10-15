@@ -1,7 +1,7 @@
 const { query } = require("../db/pool");
 const { endOfMonth, shift } = require("./dates");
 
-// The purchase process from the "PUR Process" sheet. Ten steps, one input:
+// The purchase process from the "PUR Process" sheet. Nine steps, one input:
 // step 1 (Issue PO = N1) is the only date a person types (or the SAP export
 // supplies); every later step is just "done" with the day it happened.
 //
@@ -15,7 +15,10 @@ const { endOfMonth, shift } = require("./dates");
 //   7   Clearing & delivery to TP = N5         N4+7
 //   8   Input Declaration                      N5+1
 //   9   Factory goods received                 N5+2    <- arrival
-//   10  Monthly report                         every month end
+//
+// The sheet's 10th line, "Monthly report", is not a step of a shipment: it is
+// the month-end email/report (mailScheduler + Monthly Report page), so a PO is
+// complete once its goods are received.
 //
 // "Flex" step: the S/I wait is mostly the supplier's production time, which is
 // what the material master's lead time measures. When the section has
@@ -59,11 +62,7 @@ const DEFAULT_STEPS = [
   { stepNo: 9, code: "GOODS_RECEIVED", name: "Factory goods received", shortName: "Received", milestone: null,
     anchorStepNo: 7, offsetDays: 2, offsetMode: "DAYS", isFlex: false, isArrival: true,
     referenceLabel: null, icon: "warehouse",
-    description: "Goods arrive at the factory — this is the shipment's ETA." },
-  { stepNo: 10, code: "MONTHLY_REPORT", name: "Monthly report", shortName: "Report", milestone: null,
-    anchorStepNo: 9, offsetDays: 0, offsetMode: "END_OF_MONTH", isFlex: false, isArrival: false,
-    referenceLabel: null, icon: "summarize",
-    description: "Included in the month-end report (due on the last day of the month the goods arrived)." }
+    description: "Goods arrive at the factory — this is the shipment's ETA." }
 ];
 
 const STEP_COUNT = DEFAULT_STEPS.length;
@@ -102,12 +101,16 @@ async function insertDefaultSteps(runner, sectionId) {
 }
 
 async function getWorkflow(sectionId) {
-  let rows = (await query("SELECT * FROM workflow_steps WHERE section_id = @sectionId ORDER BY step_no", { sectionId })).recordset;
+  const load = async () => (await query(
+    "SELECT * FROM workflow_steps WHERE section_id = @sectionId AND step_no <= @stepCount ORDER BY step_no",
+    { sectionId, stepCount: STEP_COUNT }
+  )).recordset;
+  let rows = await load();
   if (rows.length < STEP_COUNT) {
     // A section created after install, or a partial row set: fill the gaps
-    // with the defaults so the process always has its ten steps.
+    // with the defaults so the process always has all its steps.
     await insertDefaultSteps({ query }, sectionId);
-    rows = (await query("SELECT * FROM workflow_steps WHERE section_id = @sectionId ORDER BY step_no", { sectionId })).recordset;
+    rows = await load();
   }
   return rows.map(fromRow);
 }
@@ -194,7 +197,7 @@ function computeSchedule({ steps, documentDate, leadTimeDays, actuals = {}, sett
 }
 
 function arrivalStepNo(steps) {
-  return (steps.find(s => s.isArrival) || steps[steps.length - 2] || { stepNo: 9 }).stepNo;
+  return (steps.find(s => s.isArrival) || steps[steps.length - 1] || { stepNo: STEP_COUNT }).stepNo;
 }
 
 module.exports = {

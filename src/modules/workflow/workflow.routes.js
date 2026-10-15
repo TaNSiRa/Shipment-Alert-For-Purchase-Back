@@ -4,7 +4,7 @@ const { withTransaction } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { writeAudit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection } = require("../../services/sectionService");
-const { DEFAULT_STEPS, flexOffsetFor, getWorkflow, validateWorkflow } = require("../../services/workflowService");
+const { DEFAULT_STEPS, STEP_COUNT, flexOffsetFor, getWorkflow, validateWorkflow } = require("../../services/workflowService");
 const { getSectionSettings, scheduleSettings } = require("../../services/settingsService");
 const { recomputeSection } = require("../../services/poService");
 const { emitSection } = require("../../services/realtimeService");
@@ -22,7 +22,7 @@ router.get("/", asyncHandler(async (req, res) => {
 }));
 
 const stepSchema = z.object({
-  stepNo: z.number().int().min(1).max(10),
+  stepNo: z.number().int().min(1).max(STEP_COUNT),
   name: z.string().trim().min(1).max(150),
   shortName: z.string().trim().min(1).max(40),
   description: z.string().trim().max(500).optional().nullable(),
@@ -35,7 +35,7 @@ const stepSchema = z.object({
 });
 
 router.put("/", requireSectionAdmin, asyncHandler(async (req, res) => {
-  const { steps, recalculate } = z.object({ steps: z.array(stepSchema).length(10), recalculate: z.boolean().default(true) }).parse(req.body);
+  const { steps, recalculate } = z.object({ steps: z.array(stepSchema).length(STEP_COUNT), recalculate: z.boolean().default(true) }).parse(req.body);
   const normalized = steps.map(s => (s.stepNo === 1 ? { ...s, anchorStepNo: null, offsetDays: 0, offsetMode: "DAYS", isFlex: false } : s));
   const problems = validateWorkflow(normalized);
   if (problems.length) return res.status(400).json({ message: problems[0], problems });

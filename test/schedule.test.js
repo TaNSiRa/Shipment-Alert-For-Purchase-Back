@@ -41,8 +41,8 @@ test("the Excel example (fixed offsets) reproduces the sheet's dates", () => {
   assert.equal(due[6], "2026-05-09"); // N3+10
   assert.equal(due[7], "2026-05-16"); // N4+7
   assert.equal(due[8], "2026-05-17"); // N5+1
-  assert.equal(due[9], "2026-05-18"); // N5+2
-  assert.equal(due[10], "2026-05-31"); // month end
+  assert.equal(due[9], "2026-05-18"); // N5+2 = arrival, the last step
+  assert.equal(due[10], undefined);
 });
 
 test("material lead time stretches the S/I step so arrival = PO date + lead time", () => {
