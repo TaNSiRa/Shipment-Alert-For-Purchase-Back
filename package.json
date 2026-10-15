@@ -1,0 +1,35 @@
+{
+  "name": "purchase-shipment-alert-api",
+  "version": "1.0.0",
+  "description": "Purchase Shipment Alert (PSA) backend API",
+  "main": "src/server.js",
+  "private": true,
+  "scripts": {
+    "dev": "nodemon -L --watch src src/server.js",
+    "start": "node src/server.js",
+    "db:init": "node scripts/init-db.js",
+    "db:seed-master": "node scripts/import-master-xlsx.js",
+    "db:seed-demo": "node scripts/seed-demo.js",
+    "test": "node --test --test-concurrency=1 test/"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-session": "^1.19.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "mssql": "^11.0.1",
+    "nodemailer": "^10.1.1",
+    "socket.io": "^4.8.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9",
+    "supertest": "^7.2.2"
+  }
+}
