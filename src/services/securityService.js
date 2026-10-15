@@ -102,7 +102,7 @@ function clearSession(req, res, callback) {
 
 // The two endpoints that CREATE a session. They cannot be asked for a CSRF
 // token — the login page has never been given one — and they do not need to be:
-// both demand a credential (password / verified Microsoft id_token) that an
+// both demand a credential (password / one-time Microsoft ticket) that an
 // attacker's page cannot produce from the victim's browser.
 //
 // Without this exemption a session cookie that outlives its own login (revoked
@@ -112,7 +112,7 @@ function clearSession(req, res, callback) {
 // again answers 403 CSRF_REQUIRED. And it does not heal on its own, because the
 // login page polls /health every 10s and `rolling: true` re-ups the cookie on
 // every one of those.
-const SESSION_ENTRY_PATHS = new Set(["/api/auth/login"]);
+const SESSION_ENTRY_PATHS = new Set(["/api/auth/login", "/api/auth/microsoft/exchange"]);
 
 // Express routes case-insensitively and ignores a trailing slash, so the set
 // above is compared against a path normalised the same way it matches.

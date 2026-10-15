@@ -1,6 +1,7 @@
 const express = require("express");
 const { query } = require("../../db/pool");
 const { isMailConfigured } = require("../../services/mailService");
+const { isMicrosoftEnabled } = require("../../services/microsoftAuth");
 
 const router = express.Router();
 
@@ -13,7 +14,14 @@ router.get("/", async (req, res) => {
   } catch {
     database = "offline";
   }
-  res.json({ api: "ok", database, mail: isMailConfigured() ? "configured" : "not_configured", time: new Date().toISOString() });
+  res.json({
+    api: "ok",
+    database,
+    mail: isMailConfigured() ? "configured" : "not_configured",
+    // The login page shows "Sign in with Microsoft" only when this is true.
+    microsoftLogin: isMicrosoftEnabled(),
+    time: new Date().toISOString()
+  });
 });
 
 module.exports = router;

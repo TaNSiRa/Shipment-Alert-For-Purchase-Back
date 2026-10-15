@@ -45,6 +45,20 @@ if (!["strict", "lax", "none"].includes(sameSite)) {
   throw new Error("SESSION_COOKIE_SAME_SITE must be strict, lax, or none");
 }
 
+// Microsoft 365 sign-in is on only when all four are set. The tenant must be
+// the directory GUID (not "common"/"organizations"): only people from that one
+// tenant may ever sign in, and the id_token check pins its issuer to it.
+const microsoft = {
+  tenantId: `${process.env.MS_TENANT_ID || ""}`.trim(),
+  clientId: `${process.env.MS_CLIENT_ID || ""}`.trim(),
+  clientSecret: `${process.env.MS_CLIENT_SECRET || ""}`.trim(),
+  redirectUri: `${process.env.MS_REDIRECT_URI || ""}`.trim()
+};
+microsoft.enabled = Boolean(microsoft.tenantId && microsoft.clientId && microsoft.clientSecret && microsoft.redirectUri);
+if (microsoft.enabled && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(microsoft.tenantId)) {
+  throw new Error("MS_TENANT_ID must be the directory (tenant) GUID from Entra ID");
+}
+
 const env = {
   nodeEnv: process.env.NODE_ENV || "development",
   apiHost: process.env.API_HOST || "127.0.0.1",
@@ -64,6 +78,10 @@ const env = {
   enableHsts: boolEnv("ENABLE_HSTS"),
   trustProxyHops: numberEnv("TRUST_PROXY_HOPS", 0),
   mailSchedulerEnabled: boolEnv("MAIL_SCHEDULER_ENABLED", true),
+  // Folder of the Flutter release build (frontend/build/web). Set it and the
+  // API serves the web app too, from its own origin, under the SPA's CSP.
+  webRoot: process.env.WEB_ROOT ? path.resolve(__dirname, "../..", process.env.WEB_ROOT) : "",
+  microsoft,
   session: {
     secret: sessionSecret,
     cookieName: process.env.SESSION_COOKIE_NAME || "psa_session",

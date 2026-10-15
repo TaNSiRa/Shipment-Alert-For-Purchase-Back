@@ -20,6 +20,7 @@ const {
 const { sendMail } = require("../../services/mailService");
 const { buildAccountLockedEmail } = require("../../services/emailTemplates");
 const { thaiWallNow } = require("../../services/thaiTime");
+const microsoft = require("../../services/microsoftAuth");
 const { wallTime } = require("../../services/serialize");
 
 const router = express.Router();
@@ -147,6 +148,76 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
   }
   await recordSuccess(user.id);
   await writeAudit({ actorId: user.id, action: "LOGIN", entityType: "AUTH", ...meta });
+  res.json(await completeLogin(req, user));
+}));
+
+// --- Sign in with Microsoft 365 (see services/microsoftAuth.js) -------------
+
+function requireMicrosoft(req, res, next) {
+  if (!microsoft.isMicrosoftEnabled()) return res.status(404).json({ message: "Microsoft sign-in is not configured" });
+  next();
+}
+
+router.get("/microsoft/start", requireMicrosoft, (req, res) => {
+  const returnTo = microsoft.safeReturnTo(req.query.returnTo, req);
+  res.redirect(302, microsoft.beginSignIn(req, res, returnTo));
+});
+
+// Every way out of the callback is a redirect back to the app — the person is
+// mid-navigation in a full browser tab, not in an API call. Failures carry
+// only a code; the details go to the audit log and the server console.
+router.get("/microsoft/callback", requireMicrosoft, asyncHandler(async (req, res) => {
+  const meta = { ip: req.ip, userAgent: req.headers["user-agent"] };
+  const pending = microsoft.takePending(req, res, `${req.query.state || ""}`);
+  const back = params => res.redirect(302, microsoft.withParams(
+    pending?.returnTo || microsoft.safeReturnTo(null, req), params));
+
+  if (!pending) return back({ ms_error: "EXPIRED" });
+  if (req.query.error) {
+    // access_denied = the person pressed Cancel / has no consent; nothing to log.
+    return back({ ms_error: req.query.error === "access_denied" ? "CANCELLED" : "MICROSOFT_ERROR" });
+  }
+  if (!req.query.code) return back({ ms_error: "MICROSOFT_ERROR" });
+
+  let email;
+  try {
+    const idToken = await microsoft.redeemCode(`${req.query.code}`, pending.verifier);
+    const claims = await microsoft.verifyIdToken(idToken, { nonce: pending.nonce });
+    email = microsoft.emailFromClaims(claims);
+  } catch (err) {
+    console.error(`[auth] Microsoft sign-in failed: ${err.message}`);
+    await writeAudit({ actorId: null, action: "LOGIN_FAILED", entityType: "AUTH", entityId: "microsoft",
+      afterValue: { reason: err.code || "MICROSOFT_ERROR", method: "MICROSOFT" }, ...meta });
+    return back({ ms_error: "MICROSOFT_ERROR" });
+  }
+
+  const user = email ? await findActiveUserByIdentifier(email) : null;
+  // Only an exact email match counts — the identifier lookup also accepts an
+  // employee number, which a Microsoft account must never be matched by.
+  if (!user || `${user.email || ""}`.trim().toLowerCase() !== email) {
+    await writeAudit({ actorId: null, action: "LOGIN_FAILED", entityType: "AUTH", entityId: `${email || "?"}`.slice(0, 100),
+      afterValue: { reason: "NO_SUCH_ACTIVE_USER", method: "MICROSOFT" }, ...meta });
+    return back({ ms_error: "NOT_REGISTERED" });
+  }
+  if (lockedUntil(user)) {
+    await writeAudit({ actorId: user.id, action: "LOGIN_BLOCKED", entityType: "AUTH", entityId: email,
+      afterValue: { method: "MICROSOFT" }, ...meta });
+    return back({ ms_error: "LOCKED" });
+  }
+  back({ ms_ticket: microsoft.issueTicket(res, user.id) });
+}));
+
+router.post("/microsoft/exchange", loginLimiter, requireMicrosoft, asyncHandler(async (req, res) => {
+  const { ticket } = z.object({ ticket: z.string().min(1).max(200) }).parse(req.body);
+  const userId = microsoft.redeemTicket(req, res, ticket);
+  const user = userId ? await findActiveUserById(userId) : null;
+  if (!user || lockedUntil(user)) {
+    noteIfExhausted(req);
+    return res.status(401).json({ message: "Microsoft sign-in expired. Please try again." });
+  }
+  await recordSuccess(user.id);
+  await writeAudit({ actorId: user.id, action: "LOGIN", entityType: "AUTH", afterValue: { method: "MICROSOFT" },
+    ip: req.ip, userAgent: req.headers["user-agent"] });
   res.json(await completeLogin(req, user));
 }));
 
