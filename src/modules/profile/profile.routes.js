@@ -109,7 +109,7 @@ router.patch("/password", asyncHandler(async (req, res) => {
 router.get("/activity", asyncHandler(async (req, res) => {
   const rows = (await query(
     `SELECT TOP 30 action, entity_type, ip_address, user_agent, created_at FROM audit_logs
-     WHERE actor_user_id = @id AND action IN ('LOGIN','LOGOUT','LOGIN_FAILED','ACCOUNT_LOCKED','CHANGE_PASSWORD','EDIT_PROFILE','EDIT_AVATAR','PDPA_ACCEPT')
+     WHERE actor_user_id = @id AND action IN ('LOGIN','MICROSOFT_LOGIN','LOGOUT','LOGIN_FAILED','LOGIN_BLOCKED','ACCOUNT_LOCKED','CHANGE_PASSWORD','EDIT_PROFILE','EDIT_AVATAR','PDPA_ACCEPT')
      ORDER BY created_at DESC`,
     { id: req.user.id }
   )).recordset;

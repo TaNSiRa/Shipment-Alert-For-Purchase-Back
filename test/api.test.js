@@ -371,3 +371,62 @@ test("calendar, roadmap and list filters", async () => {
   const exp = await api.viewer.get("/pos/export?status=ACTIVE").buffer(true);
   assert.equal(exp.status, 200);
 });
+
+// --- Security parity with RAP (token-revocation, session-relogin,
+// security-hardening tests over there). buyer2 is not used after this point.
+
+test("logout revokes the account's tokens on every device", async () => {
+  const a = await login("buyer2@test.local");
+  const b = await login("buyer2@test.local");
+  assert.equal((await client(b.token).get("/pos")).status, 200);
+  const out = await a.agent.post("/api/auth/logout").set("Authorization", `Bearer ${a.token}`).set("X-CSRF-Token", a.csrf);
+  assert.equal(out.status, 200);
+  const other = await client(b.token).get("/pos");
+  assert.equal(other.status, 401);
+  assert.equal(other.body.message, "SESSION_REVOKED");
+});
+
+test("a revoked session cookie does not block the next sign-in", async () => {
+  const s = await login("buyer2@test.local");
+  // Revoked from elsewhere (password reset, logout on another device).
+  await query("UPDATE users SET token_version = token_version + 1 WHERE email = 'buyer2@test.local'");
+  require("../src/services/accountState").resetAccountStateCache();
+  assert.equal((await s.agent.get("/api/auth/session")).status, 401);
+  // Same browser, no CSRF token: login must still work (no CSRF_REQUIRED lockout).
+  const again = await s.agent.post("/api/auth/login").send({ email: "buyer2@test.local", password: PASSWORD });
+  assert.equal(again.status, 200, JSON.stringify(again.body));
+});
+
+test("tokens: alg none and a foreign secret are refused", async () => {
+  const jwt = require("jsonwebtoken");
+  const s = await login("buyer2@test.local");
+  const claims = jwt.decode(s.token);
+  delete claims.iat;
+  delete claims.exp;
+  const none = jwt.sign(claims, null, { algorithm: "none" });
+  assert.equal((await client(none).get("/pos")).status, 401);
+  const forged = jwt.sign(claims, "not-the-server-secret", { algorithm: "HS256" });
+  assert.equal((await client(forged).get("/pos")).status, 401);
+});
+
+test("failed sign-ins are audited with IP and user agent, never the password", async () => {
+  await request(app).post("/api/auth/login").set("User-Agent", "audit-probe").send({ email: "nobody@test.local", password: "S3cret-guess" });
+  const row = (await query(
+    "SELECT TOP 1 * FROM audit_logs WHERE action = 'LOGIN_FAILED' AND entity_id = 'nobody@test.local' ORDER BY id DESC"
+  )).recordset[0];
+  assert.ok(row);
+  assert.ok(row.ip_address);
+  assert.equal(row.user_agent, "audit-probe");
+  assert.doesNotMatch(JSON.stringify(row), /S3cret-guess/);
+});
+
+test("security headers on API responses", async () => {
+  const res = await request(app).get("/api/health");
+  assert.equal(res.headers["x-powered-by"], undefined);
+  assert.match(res.headers["content-security-policy"], /default-src 'none'/);
+  assert.match(res.headers["content-security-policy"], /frame-ancestors 'none'/);
+  assert.match(res.headers["permissions-policy"], /camera=\(\)/);
+  assert.equal(res.headers["x-content-type-options"], "nosniff");
+  const cors = await request(app).get("/api/health").set("Origin", "http://evil.example");
+  assert.equal(cors.headers["access-control-allow-origin"], undefined);
+});

@@ -152,7 +152,7 @@ router.get("/audit", asyncHandler(async (req, res) => {
     where.push("(a.action LIKE @q OR a.entity_type LIKE @q OR a.entity_id LIKE @q OR u.display_name LIKE @q OR a.ip_address LIKE @q)");
   }
   if (req.query.security === "true") {
-    where.push("a.action IN ('LOGIN','LOGIN_FAILED','ACCOUNT_LOCKED','LOGIN_BLOCKED','LOGOUT','CHANGE_PASSWORD','RESET_PASSWORD','UNLOCK_ACCOUNT','UNBLOCK_LOGIN','UNBLOCK_LOGIN_ALL')");
+    where.push("a.action IN ('LOGIN','LOGIN_FAILED','MICROSOFT_LOGIN','MICROSOFT_LOGIN_FAILED','ACCOUNT_LOCKED','LOGIN_BLOCKED','LOGOUT','CHANGE_PASSWORD','RESET_PASSWORD','UNLOCK_ACCOUNT','UNBLOCK_LOGIN','UNBLOCK_LOGIN_ALL')");
   }
   const total = (await query(`SELECT COUNT(1) AS n FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id WHERE ${where.join(" AND ")}`, params)).recordset[0].n;
   const rows = (await query(

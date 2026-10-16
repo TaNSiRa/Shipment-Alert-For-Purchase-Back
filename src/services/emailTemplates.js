@@ -185,13 +185,14 @@ function buildMonthlyReportEmail({ sectionName, report }) {
   };
 }
 
-function buildAccountLockedEmail({ greetingName, lockedUntil, lockMinutes, failures, ip }) {
+function buildAccountLockedEmail({ greetingName, lockedUntil, lockMinutes, failures, ip, userAgent }) {
   const until = lockedUntil instanceof Date ? lockedUntil.toISOString().slice(0, 16).replace("T", " ") : `${lockedUntil || ""}`;
   const body = `<div style="${FONT}font-size:14px;color:${C.text};line-height:1.7;">
     Hello ${esc(greetingName)},<br><br>
     Your Purchase Shipment Alert account was locked after <b>${esc(failures)}</b> wrong passwords in a row.
     It opens again automatically after <b>${esc(lockMinutes)} minutes</b> (at ${esc(until)}), or an admin can unlock it.<br><br>
-    The last attempt came from IP <b>${esc(ip || "-")}</b>. If this was not you, tell your system admin.
+    The last attempt came from IP <b>${esc(ip || "-")}</b> (${esc(`${userAgent || "unknown browser"}`.slice(0, 200))}).
+    If this was not you, tell your system admin.
   </div>`;
   return { subject: "Security alert — your account was locked", html: shell({ title: "Account locked", body }), type: "ACCOUNT_LOCKED" };
 }
