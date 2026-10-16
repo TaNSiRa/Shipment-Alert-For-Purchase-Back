@@ -9,6 +9,7 @@ const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, regenerateSession, setLoggedInSession } = require("../../services/securityService");
 const { bumpTokenVersion, setMustChangePassword } = require("../../services/accountState");
+const { positionLabel } = require("../../services/orgService");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { getUserSections, requireAdmin } = require("../../services/sectionService");
 const { POLICY_VERSION, hasCurrentConsent } = require("../../services/pdpa");
@@ -43,8 +44,10 @@ registerLimiter(loginLimiter);
 
 const loginSchema = z.object({ email: z.string().min(1).max(255), password: z.string().min(1).max(256) });
 
-const USER_SELECT = `SELECT TOP 1 u.*, r.code AS role_code, r.name AS role_name
-  FROM users u JOIN roles r ON r.id = u.role_id`;
+const USER_SELECT = `SELECT TOP 1 u.*, r.code AS role_code, r.name AS role_name,
+    p.name AS position_name, p.abbreviation AS position_abbr
+  FROM users u JOIN roles r ON r.id = u.role_id
+  LEFT JOIN positions p ON p.id = u.position_id`;
 
 async function findActiveUserByIdentifier(identifier) {
   const value = `${identifier || ""}`.trim();
@@ -68,10 +71,16 @@ function sanitizeUser(user) {
     displayName: user.display_name,
     fullName: user.full_name,
     namePrefix: user.name_prefix,
+    branch: user.branch,
     department: user.department,
-    position: user.position,
+    section: user.section,
+    positionId: user.position_id,
+    positionName: user.position_name ?? null,
+    positionAbbr: user.position_abbr ?? null,
+    position: positionLabel(user.position_name, user.position_abbr) || user.position || null,
     phone: user.phone,
     avatar: user.avatar ?? null,
+    badgePhotoPos: user.badge_photo_pos ?? null,
     roleCode: user.role_code,
     roleName: user.role_name,
     receiveDailyMail: user.receive_daily_mail === true || user.receive_daily_mail === 1,

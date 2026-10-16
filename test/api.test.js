@@ -211,6 +211,28 @@ test("duplicate and invalid manual POs are refused", async () => {
   assert.equal((await api.buyer.post("/pos", { poNo: "T-NOITEM", supplierId: sup.id, documentDate: todayIso(), items: [] })).status, 400);
 });
 
+test("manual PO lines only take materials of the PO's supplier", async () => {
+  const sups = (await api.buyer.get("/masters/lookup")).body.suppliers;
+  const nihon = sups.find(s => s.supplierCode === "12200003");
+  const newfluo = sups.find(s => s.supplierCode === "11200024");
+  const nihonMat = (await api.buyer.get(`/masters/lookup?supplierId=${nihon.id}`)).body.materials[0];
+  const foreign = await api.buyer.post("/pos", {
+    poNo: "T-SUP-1", supplierId: newfluo.id, documentDate: todayIso(), items: [{ itemNo: "10", materialId: nihonMat.id }]
+  });
+  assert.equal(foreign.status, 400, JSON.stringify(foreign.body));
+  // 13000150 is under both suppliers; a typed code takes the PO supplier's row.
+  const typed = await api.buyer.post("/pos", {
+    poNo: "T-SUP-2", supplierId: newfluo.id, documentDate: todayIso(), items: [{ materialCode: "13000150" }]
+  });
+  assert.equal(typed.status, 201, JSON.stringify(typed.body));
+  const line = (await query(
+    "SELECT i.lead_time_days, m.supplier_id FROM po_items i JOIN materials m ON m.id = i.material_id WHERE i.po_id = @id",
+    { id: typed.body.id }
+  )).recordset[0];
+  assert.equal(line.supplier_id, newfluo.id);
+  assert.equal(line.lead_time_days, 60);
+});
+
 test("masters: section admin edits, user cannot, referenced rows cannot be deleted", async () => {
   const s = await api.buyer.post("/masters/suppliers", { supplierCode: "99999999", name: "TEST SUPPLIER" });
   assert.equal(s.status, 403);
@@ -285,9 +307,37 @@ test("mail: preview escapes data, send-now records the outbox, scheduler fires o
   assert.equal(runs, 1);
 });
 
+test("mail: a section admin switches anyone's daily email; the mail log pages", async () => {
+  const members = (await api.secadmin.get("/settings/mail/members")).body.data;
+  const buyer = members.find(m => m.email === "buyer@test.local");
+  assert.ok(buyer);
+  try {
+    assert.equal((await api.secadmin.patch(`/settings/mail/members/${buyer.id}`, { receiveDailyMail: false })).status, 200);
+    assert.ok(!(await api.secadmin.get("/settings/mail/status")).body.recipients.includes("buyer@test.local"));
+    assert.equal((await api.secadmin.patch(`/settings/mail/members/${buyer.id}`, { receiveDailyMail: true })).status, 200);
+    assert.ok((await api.secadmin.get("/settings/mail/status")).body.recipients.includes("buyer@test.local"));
+  } finally {
+    await query("UPDATE users SET receive_daily_mail = 1 WHERE id = @id", { id: buyer.id });
+  }
+  assert.equal((await api.buyer.patch(`/settings/mail/members/${buyer.id}`, { receiveDailyMail: false })).status, 403);
+  assert.equal((await api.secadmin.patch("/settings/mail/members/999999", { receiveDailyMail: false })).status, 404);
+
+  const page = await api.secadmin.get("/settings/outbox?page=1&pageSize=1");
+  assert.equal(page.status, 200);
+  assert.ok(page.body.data.length <= 1);
+  assert.equal(typeof page.body.total, "number");
+});
+
 test("users: section admin cannot create admins; new user must change password", async () => {
   const bad = await api.secadmin.post("/users", { email: "boss@test.local", displayName: "Boss", roleCode: "ADMIN", password: PASSWORD });
   assert.equal(bad.status, 403);
+  // ...but can add another section admin to their own section.
+  const peer = await api.secadmin.post("/users", {
+    email: "peer@test.local", displayName: "Peer", roleCode: "SECTION_ADMIN", password: PASSWORD, isSectionAdmin: true
+  });
+  assert.equal(peer.status, 201, JSON.stringify(peer.body));
+  assert.equal((await api.secadmin.patch(`/users/${peer.body.id}/membership`, { isSectionAdmin: false })).status, 200);
+  assert.equal((await api.secadmin.patch(`/users/${peer.body.id}`, { phone: "555" })).status, 200);
   assert.equal((await api.buyer.get("/users")).status, 403);
   const weak = await api.secadmin.post("/users", { email: "new1@test.local", displayName: "New", roleCode: "USER", password: "abc" });
   assert.equal(weak.status, 400);
@@ -310,6 +360,63 @@ test("users: section admin cannot create admins; new user must change password",
   assert.equal(row.display_name, "New One"); // untouched fields stay
   assert.equal((await api.secadmin.patch(`/users/${ok.body.id}`, { isActive: false })).status, 200);
   assert.equal((await client(changed.body.token).get("/pos")).status, 401);
+});
+
+test("users: org fields from RAP's lists, role sets access, reset forces a new password", async () => {
+  const opts = (await api.secadmin.get("/users/org-options")).body;
+  assert.ok(opts.branches.includes("BANGPOO12"));
+  assert.ok(opts.departments.includes("Purchasing"));
+  assert.ok(opts.sections.length > 0);
+  const eng = opts.positions.find(p => p.abbreviation === "E8");
+  assert.ok(eng);
+  const created = await api.secadmin.post("/users", {
+    email: "org1@test.local", displayName: "Org One", roleCode: "USER", password: PASSWORD,
+    branch: "BANGPOO12", department: "Purchasing", section: opts.sections[0], positionId: eng.id
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal((await api.secadmin.post("/users", {
+    email: "org2@test.local", displayName: "Org Two", roleCode: "USER", password: PASSWORD, positionId: 999999
+  })).status, 400);
+  const id = created.body.id;
+  const find = async () => (await api.secadmin.get("/users")).body.data.find(u => u.id === id);
+  let u = await find();
+  assert.equal(u.branch, "BANGPOO12");
+  assert.equal(u.position, "Engineer (E8)");
+  assert.equal(u.membership.canEdit, true);
+  assert.equal(u.membership.isSectionAdmin, false);
+  // The role alone decides the access in the section.
+  assert.equal((await api.secadmin.patch(`/users/${id}`, { roleCode: "SECTION_ADMIN", positionId: null })).status, 200);
+  u = await find();
+  assert.equal(u.membership.isSectionAdmin, true);
+  assert.equal(u.position, null);
+  assert.equal((await api.secadmin.patch(`/users/${id}`, { roleCode: "USER" })).status, 200);
+  assert.equal((await find()).membership.isSectionAdmin, false);
+  // After a reset the owner must choose their own password again.
+  await query("UPDATE users SET must_change_password = 0 WHERE id = @id", { id });
+  assert.equal((await api.secadmin.post(`/users/${id}/reset-password`, { newPassword: "Reset-pass-123" })).status, 200);
+  assert.equal((await find()).mustChangePassword, true);
+  // Anyone may set their own org fields from Profile.
+  const me = await api.buyer.patch("/profile", { branch: "GATEWAY", section: opts.sections[0], positionId: eng.id });
+  assert.equal(me.status, 200, JSON.stringify(me.body));
+  assert.equal(me.body.user.branch, "GATEWAY");
+  assert.equal(me.body.user.positionAbbr, "E8");
+  assert.equal((await api.buyer.patch("/profile", { positionId: 999999 })).status, 400);
+});
+
+test("badge photo placement is saved on the account and validated", async () => {
+  const placement = async () => (await api.buyer.get("/auth/me")).body.user.badgePhotoPos;
+  const saved = await api.buyer.put("/profile/badge-photo", { placement: "-12.0,-48.5,1.240" });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.user.badgePhotoPos, "-12.0,-48.5,1.240");
+  assert.equal(await placement(), "-12.0,-48.5,1.240");
+  for (const bad of ["", "1,2", "1,2,3,4", "a,b,c", "1;2;3", "1,2,3 OR 1=1"]) {
+    assert.equal((await api.buyer.put("/profile/badge-photo", { placement: bad })).status, 400, bad);
+  }
+  assert.equal(await placement(), "-12.0,-48.5,1.240");
+  // Each account's own.
+  assert.equal((await api.secadmin.get("/auth/me")).body.user.badgePhotoPos, null);
+  assert.equal((await api.buyer.put("/profile/badge-photo", { placement: null })).status, 200);
+  assert.equal(await placement(), null);
 });
 
 test("account lockout after 5 wrong passwords, admin unlock", async () => {
@@ -355,6 +462,29 @@ test("upload checks reject junk and old .xls files", async () => {
   assert.match(old.body.message, /xlsx/);
   const tpl = await api.buyer.get("/pos/import/template").buffer(true);
   assert.equal(tpl.status, 200);
+});
+
+test("calendar lists company holidays; holiday DB settings are admin-only", async () => {
+  const month = todayIso().slice(0, 7);
+  const added = await api.admin.post("/admin/holidays", { date: `${month}-15`, name: "Test holiday" });
+  assert.equal(added.status, 200, JSON.stringify(added.body));
+  try {
+    const cal = await api.viewer.get(`/pos/calendar?month=${month}`);
+    assert.deepEqual(cal.body.holidays.find(h => h.date === `${month}-15`), { date: `${month}-15`, name: "Test holiday" });
+    const again = await api.admin.post("/admin/holidays", { date: `${month}-15`, name: "Test holiday" });
+    assert.equal(again.status, 409);
+    const list = (await api.admin.get(`/admin/holidays?year=${month.slice(0, 4)}`)).body.data;
+    assert.equal(list.find(h => h.date === `${month}-15`)?.source, "local");
+  } finally {
+    await query("DELETE FROM holidays WHERE name = 'Test holiday'");
+  }
+  assert.equal((await api.secadmin.get("/admin/holiday-db")).status, 403);
+  const saved = await api.admin.put("/admin/holiday-db", { host: "", database: "", table: "Master_Holiday", enabled: false });
+  assert.equal(saved.status, 200, JSON.stringify(saved.body));
+  assert.equal(saved.body.enabled, false);
+  assert.equal((await api.admin.put("/admin/holiday-db", { host: "", database: "x;drop", table: "", enabled: true })).status, 400);
+  const verify = await api.admin.get("/admin/holiday-db/verify");
+  assert.equal(verify.body.configured, false);
 });
 
 test("calendar, roadmap and list filters", async () => {

@@ -13,6 +13,7 @@ const {
   ROLE_CODES, canManageTargetRole, isAdmin, requireSectionAdmin, resolveSection
 } = require("../../services/sectionService");
 const { emitSection } = require("../../services/realtimeService");
+const { assertPositionExists, getOrgOptions, positionLabel } = require("../../services/orgService");
 const { wallTime } = require("../../services/serialize");
 
 const router = express.Router();
@@ -30,13 +31,16 @@ const createSchema = z.object({
   fullName: optionalText(200),
   namePrefix: optionalText(20),
   employeeNo: optionalText(50),
+  branch: optionalText(100),
   department: optionalText(100),
-  position: optionalText(100),
+  section: optionalText(100),
+  positionId: z.number().int().positive().optional().nullable(),
   phone: optionalText(50),
   roleCode: z.enum(ROLE_CODES),
   password: z.string().min(1).max(256),
-  canEdit: z.boolean().default(true),
-  isSectionAdmin: z.boolean().default(false)
+  // Normally left out: the role decides (see membershipFor).
+  canEdit: z.boolean().optional(),
+  isSectionAdmin: z.boolean().optional()
 });
 
 const editSchema = z.object({
@@ -45,8 +49,10 @@ const editSchema = z.object({
   fullName: editText(200),
   namePrefix: editText(20),
   employeeNo: editText(50),
+  branch: editText(100),
   department: editText(100),
-  position: editText(100),
+  section: editText(100),
+  positionId: z.number().int().positive().optional().nullable(),
   phone: editText(50),
   roleCode: z.enum(ROLE_CODES).optional(),
   isActive: z.boolean().optional()
@@ -59,6 +65,16 @@ function audit(req, action, entityId, afterValue) {
   });
 }
 
+// What a role means in the current section, as in RAP where the role alone
+// sets the access: a Section Admin administers it, a User edits, a Viewer
+// only looks. A System Admin needs no membership flags.
+function membershipFor(roleCode) {
+  return {
+    canEdit: roleCode === "VIEWER" ? 0 : 1,
+    isSectionAdmin: roleCode === "SECTION_ADMIN" ? 1 : 0
+  };
+}
+
 function rowOut(r, locks) {
   return {
     id: r.id,
@@ -67,8 +83,14 @@ function rowOut(r, locks) {
     fullName: r.full_name,
     namePrefix: r.name_prefix,
     employeeNo: r.employee_no,
+    branch: r.branch,
     department: r.department,
-    position: r.position,
+    section: r.section,
+    positionId: r.position_id,
+    positionName: r.position_name,
+    positionAbbr: r.position_abbr,
+    // The master-list position, or the free text from before it existed.
+    position: positionLabel(r.position_name, r.position_abbr) || r.position || null,
     phone: r.phone,
     avatar: r.avatar || null,
     roleCode: r.role_code,
@@ -90,9 +112,11 @@ function rowOut(r, locks) {
 }
 
 const LIST_SQL = `SELECT u.*, r.code AS role_code, r.name AS role_name,
+    p.name AS position_name, p.abbreviation AS position_abbr,
     m.id AS membership_id, m.can_edit, m.is_section_admin, m.is_active AS membership_active
   FROM users u
   JOIN roles r ON r.id = u.role_id
+  LEFT JOIN positions p ON p.id = u.position_id
   LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId`;
 
 // A section admin sees the people in their section (never the global admins,
@@ -115,23 +139,9 @@ router.get("/roles", asyncHandler(async (req, res) => {
   res.json({ data: rows.filter(r => canManageTargetRole(req.user, r.code)) });
 }));
 
-// Existing accounts that are not in this section yet — to add someone who
-// already uses the system elsewhere instead of creating a duplicate.
-router.get("/lookup", asyncHandler(async (req, res) => {
-  const q = `${req.query.q || ""}`.trim();
-  if (q.length < 2) return res.json({ data: [] });
-  const like = `%${q.replace(/[%_[]/g, ch => `[${ch}]`)}%`;
-  const rows = (await query(
-    `SELECT TOP 20 u.id, u.email, u.display_name, u.department, r.code AS role_code
-     FROM users u JOIN roles r ON r.id = u.role_id
-     WHERE u.is_active = 1 AND (u.email LIKE @like OR u.display_name LIKE @like OR u.employee_no LIKE @like)
-       AND NOT EXISTS (SELECT 1 FROM user_section_memberships m WHERE m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1)
-     ORDER BY u.display_name`,
-    { like, sectionId: req.section.id }
-  )).recordset;
-  res.json({ data: rows.filter(r => canManageTargetRole(req.user, r.role_code)).map(r => ({
-    id: r.id, email: r.email, displayName: r.display_name, department: r.department, roleCode: r.role_code
-  })) });
+// Dropdown lists for the user form (Position, Branch, Department, Section).
+router.get("/org-options", asyncHandler(async (req, res) => {
+  res.json(await getOrgOptions());
 }));
 
 async function loadTarget(req, id) {
@@ -152,22 +162,25 @@ router.post("/", asyncHandler(async (req, res) => {
   if (!canManageTargetRole(req.user, input.roleCode)) return res.status(403).json({ message: "You cannot create this kind of account" });
   if (rejectWeakPassword(res, input.password)) return;
   const exists = (await query("SELECT id FROM users WHERE LOWER(email) = @email", { email: input.email })).recordset[0];
-  if (exists) return res.status(409).json({ message: "This email is already used — use “Add existing user” instead" });
-  const isSectionAdmin = isAdmin(req.user) && input.roleCode === "SECTION_ADMIN" ? input.isSectionAdmin : false;
+  if (exists) return res.status(409).json({ message: "This email is already used by another account" });
+  await assertPositionExists(input.positionId);
+  const flags = membershipFor(input.roleCode);
+  if (input.canEdit === false) flags.canEdit = 0;
+  if (input.isSectionAdmin === false) flags.isSectionAdmin = 0;
   const hash = await bcrypt.hash(input.password, env.bcryptRounds);
   const id = await withTransaction(async tx => {
     const role = (await tx.query("SELECT id FROM roles WHERE code = @code", { code: input.roleCode })).recordset[0];
     const user = (await tx.query(
-      `INSERT INTO users (email, display_name, full_name, name_prefix, employee_no, department, position, phone,
+      `INSERT INTO users (email, display_name, full_name, name_prefix, employee_no, branch, department, section, position_id, phone,
          password_hash, role_id, must_change_password)
        OUTPUT INSERTED.id
-       VALUES (@email, @displayName, @fullName, @namePrefix, @employeeNo, @department, @position, @phone, @hash, @roleId, 1)`,
-      { ...input, hash, roleId: role.id }
+       VALUES (@email, @displayName, @fullName, @namePrefix, @employeeNo, @branch, @department, @section, @positionId, @phone, @hash, @roleId, 1)`,
+      { ...input, positionId: input.positionId ?? null, hash, roleId: role.id }
     )).recordset[0];
     await tx.query(
       `INSERT INTO user_section_memberships (user_id, section_id, can_edit, is_section_admin)
        VALUES (@userId, @sectionId, @canEdit, @isSectionAdmin)`,
-      { userId: user.id, sectionId: req.section.id, canEdit: input.roleCode === "VIEWER" ? 0 : input.canEdit ? 1 : 0, isSectionAdmin: isSectionAdmin ? 1 : 0 }
+      { userId: user.id, sectionId: req.section.id, ...flags }
     );
     return user.id;
   });
@@ -190,9 +203,10 @@ router.patch("/:id(\\d+)", asyncHandler(async (req, res) => {
     const taken = (await query("SELECT id FROM users WHERE LOWER(email) = @email AND id <> @id", { email: input.email, id })).recordset[0];
     if (taken) return res.status(409).json({ message: "This email is already used by another account" });
   }
+  await assertPositionExists(input.positionId);
   const fields = {
     email: "email", displayName: "display_name", fullName: "full_name", namePrefix: "name_prefix", employeeNo: "employee_no",
-    department: "department", position: "position", phone: "phone"
+    branch: "branch", department: "department", section: "section", positionId: "position_id", phone: "phone"
   };
   const sets = [];
   const params = { id };
@@ -215,6 +229,14 @@ router.patch("/:id(\\d+)", asyncHandler(async (req, res) => {
   if ((input.roleCode && input.roleCode !== target.role_code) || input.isActive === false) await bumpTokenVersion(id);
   if (input.roleCode === "VIEWER") {
     await query("UPDATE user_section_memberships SET can_edit = 0, is_section_admin = 0 WHERE user_id = @id", { id });
+  } else if (input.roleCode && input.roleCode !== target.role_code && input.roleCode !== "ADMIN") {
+    // The new role's access in this section (Section Admin administers it,
+    // User edits it).
+    await query(
+      `UPDATE user_section_memberships SET can_edit = @canEdit, is_section_admin = @isSectionAdmin
+       WHERE user_id = @id AND section_id = @sectionId`,
+      { id, sectionId: req.section.id, ...membershipFor(input.roleCode) }
+    );
   }
   forgetAccount(id);
   await audit(req, "EDIT_USER", id, input);
@@ -226,8 +248,8 @@ router.patch("/:id(\\d+)/membership", asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const input = z.object({ canEdit: z.boolean().optional(), isSectionAdmin: z.boolean().optional() }).parse(req.body);
   const target = await loadTarget(req, id);
-  if (input.isSectionAdmin !== undefined && !isAdmin(req.user)) {
-    return res.status(403).json({ message: "Only a system admin can grant section admin" });
+  if (id === req.user.id && input.isSectionAdmin === false && !isAdmin(req.user)) {
+    return res.status(400).json({ message: "You cannot remove your own section admin access" });
   }
   if (input.isSectionAdmin && target.role_code !== "SECTION_ADMIN") {
     return res.status(400).json({ message: "Change the role to Section Admin first" });
@@ -249,27 +271,6 @@ router.patch("/:id(\\d+)/membership", asyncHandler(async (req, res) => {
     }
   );
   await audit(req, "EDIT_MEMBERSHIP", id, input);
-  emitSection(req.section.code, "users.updated");
-  res.json({ ok: true });
-}));
-
-router.post("/:id(\\d+)/join", asyncHandler(async (req, res) => {
-  const id = Number(req.params.id);
-  const row = (await query(
-    "SELECT u.id, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = @id AND u.is_active = 1",
-    { id }
-  )).recordset[0];
-  if (!row) return res.status(404).json({ message: "User not found" });
-  if (!canManageTargetRole(req.user, row.role_code)) return res.status(403).json({ message: "You cannot add this account" });
-  const canEdit = req.body?.canEdit === false || row.role_code === "VIEWER" ? 0 : 1;
-  await query(
-    `MERGE user_section_memberships AS t
-     USING (SELECT @id AS user_id, @sectionId AS section_id) AS s ON t.user_id = s.user_id AND t.section_id = s.section_id
-     WHEN MATCHED THEN UPDATE SET is_active = 1, can_edit = @canEdit
-     WHEN NOT MATCHED THEN INSERT (user_id, section_id, can_edit) VALUES (@id, @sectionId, @canEdit);`,
-    { id, sectionId: req.section.id, canEdit }
-  );
-  await audit(req, "ADD_TO_SECTION", id, { canEdit: Boolean(canEdit) });
   emitSection(req.section.code, "users.updated");
   res.json({ ok: true });
 }));
@@ -298,9 +299,10 @@ router.post("/:id(\\d+)/reset-password", asyncHandler(async (req, res) => {
        updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @id`,
     { id, hash }
   );
-  // The person must pick their own password at the next sign-in, and every
-  // session they have open is signed out now.
-  if (id !== req.user.id) await setMustChangePassword(id, true);
+  // The person must pick their own password at the next sign-in (an admin
+  // resetting their own too, as in RAP), and every session they have open is
+  // signed out now.
+  await setMustChangePassword(id, true);
   await bumpTokenVersion(id);
   await audit(req, "RESET_PASSWORD", id);
   res.json({ ok: true });

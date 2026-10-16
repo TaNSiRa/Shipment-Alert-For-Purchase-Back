@@ -1,6 +1,7 @@
 const express = require("express");
 const { z } = require("zod");
 const { query, withTransaction } = require("../../db/pool");
+const { getHolidayDates } = require("../../db/holidayPool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { writeAudit } = require("../../middleware/audit");
 const { requireEditor, requireSectionAdmin, resolveSection } = require("../../services/sectionService");
@@ -54,15 +55,19 @@ router.get("/import/template", asyncHandler(async (req, res) => {
 
 // Every Excel upload, newest first. The file itself is kept and downloadable.
 router.get("/import/batches", asyncHandler(async (req, res) => {
+  const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 50, 1), 200);
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const params = { sectionId: req.section.id, offset: (page - 1) * pageSize, pageSize };
+  const total = (await query("SELECT COUNT(1) AS n FROM import_batches WHERE section_id = @sectionId", params)).recordset[0].n;
   const rows = (await query(
-    `SELECT TOP 200 b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_skipped, b.items_created,
+    `SELECT b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_skipped, b.items_created,
             b.created_at, u.display_name, CAST(CASE WHEN b.file_data IS NULL THEN 0 ELSE 1 END AS BIT) AS has_file,
             DATALENGTH(b.file_data) AS file_size
      FROM import_batches b LEFT JOIN users u ON u.id = b.uploaded_by
-     WHERE b.section_id = @sectionId ORDER BY b.id DESC`,
-    { sectionId: req.section.id }
+     WHERE b.section_id = @sectionId ORDER BY b.id DESC OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY`,
+    params
   )).recordset;
-  res.json({ data: rows.map(r => ({
+  res.json({ total, page, pageSize, data: rows.map(r => ({
     id: r.id, fileName: r.file_name, sheetName: r.sheet_name, totalRows: r.total_rows, created: r.po_created,
     skipped: r.po_skipped, items: r.items_created, uploadedBy: r.display_name,
     createdAt: r.created_at ? new Date(r.created_at).toISOString().slice(0, 19) : null,
@@ -129,7 +134,16 @@ router.get("/calendar", asyncHandler(async (req, res) => {
     });
   }
   events.sort((a, b) => a.date.localeCompare(b.date) || a.poNo.localeCompare(b.poNo));
-  res.json({ month, start, end, events });
+  // Company holidays (external holiday DB + Settings › Holidays), so the
+  // calendar greys them out like weekends. The external DB has dates only.
+  const named = new Map((await query(
+    "SELECT holiday_date, name FROM holidays WHERE holiday_date BETWEEN @start AND @end",
+    { start, end }
+  )).recordset.map(r => [toIso(r.holiday_date), r.name]));
+  const external = await getHolidayDates(start, end);
+  const holidays = [...new Set([...named.keys(), ...external.dates])].sort()
+    .map(date => ({ date, name: named.get(date) || null }));
+  res.json({ month, start, end, events, holidays });
 }));
 
 // Road map: every active PO with all ten step dates, for the progress board.
@@ -216,10 +230,19 @@ router.post("/", requireEditor, asyncHandler(async (req, res) => {
   )).recordset[0];
   if (exists) return res.status(409).json({ message: `PO ${input.poNo} already exists` });
 
+  // Only this supplier's materials (plus any not tied to a supplier): the same
+  // code can sit under two suppliers with different lead times (13000150 is
+  // NIHON H/O at 76 days and NEWFLUO at 60), so another supplier's row would
+  // plan the PO on the wrong lead time.
   const materials = (await query(
-    "SELECT * FROM materials WHERE section_id = @sectionId AND is_active = 1",
-    { sectionId: req.section.id }
+    `SELECT * FROM materials WHERE section_id = @sectionId AND is_active = 1
+       AND (supplier_id = @supplierId OR supplier_id IS NULL)`,
+    { sectionId: req.section.id, supplierId: supplier.id }
   )).recordset;
+  const wrong = input.items.find(it => it.materialId && !materials.some(x => x.id === it.materialId));
+  if (wrong) {
+    return res.status(400).json({ message: `Material on item ${wrong.itemNo || "?"} is not in ${supplier.name}'s master` });
+  }
   const items = input.items.map((it, i) => {
     const code = normalizeMaterialCode(it.materialCode);
     const m = it.materialId
