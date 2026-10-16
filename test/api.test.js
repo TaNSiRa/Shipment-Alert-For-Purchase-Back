@@ -154,6 +154,10 @@ test("full run to completion, then dashboard and monthly report", async () => {
   assert.ok(dash.body.counts.active >= 1);
   assert.equal(dash.body.byStep.length, 8);
   assert.equal(dash.body.trend.length, 6);
+  for (const t of dash.body.trend) {
+    // Arrived on time / late are a part of what was planned for the month.
+    assert.ok(t.plannedOnTime + t.plannedLate <= t.planned, JSON.stringify(t));
+  }
 
   const month = addDays(start, 45).slice(0, 7);
   const rep = await api.viewer.get(`/reports/monthly?month=${month}`);

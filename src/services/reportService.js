@@ -88,7 +88,10 @@ async function dashboardSummary(sectionId, ctx) {
   const modes = {};
   for (const p of pos) modes[p.shipMode || "UNKNOWN"] = (modes[p.shipMode || "UNKNOWN"] || 0) + 1;
 
-  // Six-month trend: POs issued per month and arrivals (with on-time share).
+  // Six-month trend: POs issued per month, arrivals (with on-time share), and
+  // planned vs actual — the POs whose arrival was PLANNED for the month (the
+  // frozen plan from the PO date) and how that same set landed: arrived on
+  // time, arrived late (in any later month), or not arrived yet.
   const firstMonth = shiftMonth(thisMonth, -5);
   const trendRows = (await query(
     `SELECT FORMAT(document_date, 'yyyy-MM') AS m, COUNT(1) AS n FROM purchase_orders
@@ -98,16 +101,33 @@ async function dashboardSummary(sectionId, ctx) {
             SUM(CASE WHEN ps.actual_date <= ps.planned_date THEN 1 ELSE 0 END) AS on_time
      FROM po_steps ps JOIN purchase_orders p ON p.id = ps.po_id
      WHERE p.section_id = @sectionId AND p.status <> 'CANCELLED' AND ps.step_no = @arrival AND ps.actual_date >= @from
-     GROUP BY FORMAT(ps.actual_date, 'yyyy-MM')`,
-    { sectionId, from: `${firstMonth}-01`, arrival }
+     GROUP BY FORMAT(ps.actual_date, 'yyyy-MM');
+     SELECT FORMAT(ps.planned_date, 'yyyy-MM') AS m, COUNT(1) AS n,
+            SUM(CASE WHEN ps.actual_date IS NOT NULL AND ps.actual_date <= ps.planned_date THEN 1 ELSE 0 END) AS on_time,
+            SUM(CASE WHEN ps.actual_date > ps.planned_date THEN 1 ELSE 0 END) AS late
+     FROM po_steps ps JOIN purchase_orders p ON p.id = ps.po_id
+     WHERE p.section_id = @sectionId AND p.status <> 'CANCELLED' AND ps.step_no = @arrival
+       AND ps.planned_date >= @from AND ps.planned_date < @to
+     GROUP BY FORMAT(ps.planned_date, 'yyyy-MM')`,
+    { sectionId, from: `${firstMonth}-01`, to: `${shiftMonth(thisMonth, 1)}-01`, arrival }
   )).recordsets;
   const issued = new Map(trendRows[0].map(r => [r.m, r.n]));
   const arrived = new Map(trendRows[1].map(r => [r.m, r]));
+  const planned = new Map(trendRows[2].map(r => [r.m, r]));
   const trend = [];
   for (let i = 0; i < 6; i += 1) {
     const m = shiftMonth(firstMonth, i);
     const a = arrived.get(m);
-    trend.push({ month: m, issued: issued.get(m) || 0, arrived: a?.n || 0, onTime: a?.on_time || 0 });
+    const p = planned.get(m);
+    trend.push({
+      month: m,
+      issued: issued.get(m) || 0,
+      arrived: a?.n || 0,
+      onTime: a?.on_time || 0,
+      planned: p?.n || 0,
+      plannedOnTime: p?.on_time || 0,
+      plannedLate: p?.late || 0
+    });
   }
 
   const arrivals = pos
