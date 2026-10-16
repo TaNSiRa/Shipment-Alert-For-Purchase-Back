@@ -16,7 +16,6 @@ const SUPPLIER_ALIASES = {
   name: ["customername", "suppliername", "vendorname", "nameofsupplier"],
   shortName: ["searchterm1", "searchterm", "customershortname", "suppliershortname", "shortname"],
   country: ["country"],
-  leadTime: ["defaultleadtime", "defaultleadtimedays", "leadtimedays"],
   email: ["email", "contactemail"]
 };
 
@@ -109,7 +108,6 @@ async function readSheets(buffer) {
           skipped += 1;
           continue;
         }
-        const lt = toNumber(get(row, "leadTime"));
         // The supplier sheet is the better source for names, so it wins over
         // names picked up from the material sheet.
         suppliers.set(code, {
@@ -118,7 +116,6 @@ async function readSheets(buffer) {
           shortName: toText(get(row, "shortName"), 80) || suppliers.get(code)?.shortName || null,
           country: toText(get(row, "country"), 80),
           email: toText(get(row, "email"), 255),
-          leadTime: Number.isFinite(lt) && lt > 0 && lt <= 365 ? Math.round(lt) : null,
           fromSupplierSheet: true
         });
       }
@@ -197,20 +194,19 @@ async function applyMasterBuffer(sectionId, buffer) {
         const r = await tx.query(
           `UPDATE suppliers SET name = @name, short_name = COALESCE(@shortName, short_name),
              country = COALESCE(@country, country), contact_email = COALESCE(@email, contact_email),
-             default_lead_time_days = COALESCE(@leadTime, default_lead_time_days),
              updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
            WHERE id = @id AND (name <> @name OR ISNULL(short_name, '') <> ISNULL(COALESCE(@shortName, short_name), '')
-             OR @country IS NOT NULL OR @email IS NOT NULL OR @leadTime IS NOT NULL)`,
+             OR @country IS NOT NULL OR @email IS NOT NULL)`,
           { id: supplierIds.get(s.code), name: s.name, shortName: s.shortName || null, country: s.country || null,
-            email: s.email || null, leadTime: s.leadTime || null }
+            email: s.email || null }
         );
         if (r.rowsAffected[0]) counts.suppliersUpdated += 1;
       } else {
         const row = (await tx.query(
-          `INSERT INTO suppliers (section_id, supplier_code, name, short_name, country, contact_email, default_lead_time_days)
-           OUTPUT INSERTED.id VALUES (@sectionId, @code, @name, @shortName, @country, @email, @leadTime)`,
+          `INSERT INTO suppliers (section_id, supplier_code, name, short_name, country, contact_email)
+           OUTPUT INSERTED.id VALUES (@sectionId, @code, @name, @shortName, @country, @email)`,
           { sectionId, code: s.code, name: s.name, shortName: s.shortName || null, country: s.country || null,
-            email: s.email || null, leadTime: s.leadTime || null }
+            email: s.email || null }
         )).recordset[0];
         supplierIds.set(s.code, row.id);
         counts.suppliersNew += 1;
@@ -248,16 +244,6 @@ async function applyMasterBuffer(sectionId, buffer) {
         counts.materialsUpdated += 1;
       } else counts.materialsUnchanged += 1;
     }
-    // Each supplier's default lead time follows its own materials when nobody
-    // has set one: the longest of them.
-    await tx.query(
-      `UPDATE s SET default_lead_time_days = x.max_lt
-       FROM suppliers s
-       JOIN (SELECT supplier_id, MAX(lead_time_days) AS max_lt FROM materials
-             WHERE section_id = @sectionId AND is_active = 1 GROUP BY supplier_id) x ON x.supplier_id = s.id
-       WHERE s.section_id = @sectionId AND s.default_lead_time_days IS NULL`,
-      { sectionId }
-    );
     return { ...counts, skipped: parsed.skipped, notes: parsed.notes };
   });
 }

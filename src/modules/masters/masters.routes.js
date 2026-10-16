@@ -12,14 +12,12 @@ const router = express.Router();
 router.use(resolveSection);
 
 const text = max => z.union([z.string().trim().max(max), z.null()]).optional().transform(v => (v === "" ? null : v));
-const leadTime = z.union([z.number().int().min(1).max(365), z.null()]).optional();
 
 const supplierSchema = z.object({
   supplierCode: z.string().trim().min(1).max(30),
   name: z.string().trim().min(1).max(200),
   shortName: text(80),
   country: text(80),
-  defaultLeadTimeDays: leadTime,
   contactEmail: z.union([z.string().trim().email().max(255), z.literal(""), z.null()]).optional().transform(v => (v === "" ? null : v)),
   remark: text(500),
   isActive: z.boolean().optional()
@@ -37,7 +35,7 @@ const materialSchema = z.object({
 
 // Every optional column bound even when the client left it out (an unbound
 // @name is a SQL error, and "left out" means empty on a full-form save).
-const SUPPLIER_DEFAULTS = { shortName: null, country: null, defaultLeadTimeDays: null, contactEmail: null, remark: null };
+const SUPPLIER_DEFAULTS = { shortName: null, country: null, contactEmail: null, remark: null };
 const MATERIAL_DEFAULTS = { materialCode: null, materialType: null, vendorMaterial: null, description: null };
 
 function like(q) {
@@ -62,7 +60,6 @@ function supplierOut(r) {
     name: r.name,
     shortName: r.short_name,
     country: r.country,
-    defaultLeadTimeDays: r.default_lead_time_days,
     contactEmail: r.contact_email,
     remark: r.remark,
     isActive: r.is_active === true || r.is_active === 1,
@@ -114,9 +111,9 @@ router.post("/suppliers", requireSectionAdmin, asyncHandler(async (req, res) => 
   const dup = (await query("SELECT id FROM suppliers WHERE section_id = @sectionId AND supplier_code = @code", { sectionId: req.section.id, code: input.supplierCode })).recordset[0];
   if (dup) return res.status(409).json({ message: `Supplier ID ${input.supplierCode} already exists` });
   const row = (await query(
-    `INSERT INTO suppliers (section_id, supplier_code, name, short_name, country, default_lead_time_days, contact_email, remark, is_active)
+    `INSERT INTO suppliers (section_id, supplier_code, name, short_name, country, contact_email, remark, is_active)
      OUTPUT INSERTED.id
-     VALUES (@sectionId, @supplierCode, @name, @shortName, @country, @defaultLeadTimeDays, @contactEmail, @remark, @isActive)`,
+     VALUES (@sectionId, @supplierCode, @name, @shortName, @country, @contactEmail, @remark, @isActive)`,
     { sectionId: req.section.id, ...SUPPLIER_DEFAULTS, ...input, isActive: input.isActive === false ? 0 : 1 }
   )).recordset[0];
   await audit(req, "CREATE", "SUPPLIER", row.id, input);
@@ -134,7 +131,7 @@ router.patch("/suppliers/:id(\\d+)", requireSectionAdmin, asyncHandler(async (re
   if (dup) return res.status(409).json({ message: `Supplier ID ${input.supplierCode} already exists` });
   const r = await query(
     `UPDATE suppliers SET supplier_code = @supplierCode, name = @name, short_name = @shortName, country = @country,
-       default_lead_time_days = @defaultLeadTimeDays, contact_email = @contactEmail, remark = @remark,
+       contact_email = @contactEmail, remark = @remark,
        is_active = @isActive, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id = @id AND section_id = @sectionId`,
     { id, sectionId: req.section.id, ...SUPPLIER_DEFAULTS, ...input, isActive: input.isActive === false ? 0 : 1 }
@@ -277,7 +274,7 @@ router.delete("/materials/:id(\\d+)", requireSectionAdmin, asyncHandler(async (r
 // active materials.
 router.get("/lookup", asyncHandler(async (req, res) => {
   const suppliers = (await query(
-    "SELECT id, supplier_code, name, short_name, default_lead_time_days FROM suppliers WHERE section_id = @sectionId AND is_active = 1 ORDER BY name",
+    "SELECT id, supplier_code, name, short_name FROM suppliers WHERE section_id = @sectionId AND is_active = 1 ORDER BY name",
     { sectionId: req.section.id }
   )).recordset;
   let materials = [];
@@ -289,7 +286,7 @@ router.get("/lookup", asyncHandler(async (req, res) => {
   }
   res.json({
     suppliers: suppliers.map(s => ({
-      id: s.id, supplierCode: s.supplier_code, name: s.name, shortName: s.short_name, defaultLeadTimeDays: s.default_lead_time_days
+      id: s.id, supplierCode: s.supplier_code, name: s.name, shortName: s.short_name
     })),
     materials
   });

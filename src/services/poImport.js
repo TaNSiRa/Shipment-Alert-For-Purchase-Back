@@ -153,7 +153,7 @@ async function readLines(buffer) {
 
 async function loadMasters(sectionId) {
   const [suppliers, materials, existing] = await Promise.all([
-    query("SELECT id, supplier_code, name, short_name, default_lead_time_days FROM suppliers WHERE section_id = @sectionId", { sectionId }),
+    query("SELECT id, supplier_code, name, short_name FROM suppliers WHERE section_id = @sectionId", { sectionId }),
     query(
       `SELECT id, supplier_id, material_code, material_type, vendor_material, description, lead_time_days
        FROM materials WHERE section_id = @sectionId AND is_active = 1 AND material_code IS NOT NULL`,
@@ -268,7 +268,7 @@ async function analyze(sectionId, buffer, ctx) {
       warnings.push(`${unmatched.length} material(s) not in the Material Master (${unmatched.slice(0, 3).map(i => i.materialCode || "no code").join(", ")}${unmatched.length > 3 ? "…" : ""}) — lead time falls back`);
     }
 
-    const lead = resolveLeadTime(liveItems, supplier, ctx.sched);
+    const lead = resolveLeadTime(liveItems, ctx.sched);
     let etaDate = null;
     let nextDueDate = null;
     if (documentDate) {
@@ -348,7 +348,7 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
     // POs are linked from day one. Flagged in the remark so an admin can tidy.
     const supplierIds = new Map();
     const existing = (await tx.query(
-      "SELECT id, supplier_code, default_lead_time_days FROM suppliers WHERE section_id = @sectionId", { sectionId }
+      "SELECT id, supplier_code FROM suppliers WHERE section_id = @sectionId", { sectionId }
     )).recordset;
     for (const s of existing) supplierIds.set(`${s.supplier_code}`, s);
     let suppliersAdded = 0;
@@ -356,7 +356,7 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
       if (!p.supplierCode || supplierIds.has(p.supplierCode)) continue;
       const row = (await tx.query(
         `INSERT INTO suppliers (section_id, supplier_code, name, remark)
-         OUTPUT INSERTED.id, INSERTED.supplier_code, INSERTED.default_lead_time_days
+         OUTPUT INSERTED.id, INSERTED.supplier_code
          VALUES (@sectionId, @code, @name, N'Added automatically from a PO import')`,
         { sectionId, code: p.supplierCode, name: p.supplierName || p.supplierCode }
       )).recordset[0];

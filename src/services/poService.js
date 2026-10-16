@@ -19,12 +19,10 @@ async function loadContext(sectionId) {
 }
 
 // A PO's lead time is its slowest line — the shipment cannot arrive before
-// its last item does. Falls back to the supplier's default, then the section's.
-function resolveLeadTime(items, supplier, sched) {
+// its last item does. Falls back to the section's default.
+function resolveLeadTime(items, sched) {
   const fromItems = items.map(i => Number(i.leadTimeDays)).filter(n => Number.isFinite(n) && n > 0);
   if (fromItems.length) return { days: Math.max(...fromItems), source: "MATERIAL" };
-  const supplierDays = Number(supplier?.default_lead_time_days ?? supplier?.defaultLeadTimeDays);
-  if (Number.isFinite(supplierDays) && supplierDays > 0) return { days: supplierDays, source: "SUPPLIER" };
   return { days: sched.defaultLeadTimeDays, source: "DEFAULT" };
 }
 
@@ -53,7 +51,7 @@ async function createPo(runner, { sectionId, po, items, userId, source, batchId 
   }, 0);
   const lead = po.leadTimeDays
     ? { days: po.leadTimeDays, source: po.leadTimeSource || "MANUAL" }
-    : resolveLeadTime(live, po.supplier, ctx.sched);
+    : resolveLeadTime(live, ctx.sched);
   const due = computeSchedule({
     steps: ctx.steps,
     documentDate: po.documentDate,

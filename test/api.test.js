@@ -236,7 +236,7 @@ test("manual PO lines only take materials of the PO's supplier", async () => {
 test("masters: section admin edits, user cannot, referenced rows cannot be deleted", async () => {
   const s = await api.buyer.post("/masters/suppliers", { supplierCode: "99999999", name: "TEST SUPPLIER" });
   assert.equal(s.status, 403);
-  const created = await api.secadmin.post("/masters/suppliers", { supplierCode: "99999999", name: "TEST SUPPLIER", defaultLeadTimeDays: 45 });
+  const created = await api.secadmin.post("/masters/suppliers", { supplierCode: "99999999", name: "TEST SUPPLIER" });
   assert.equal(created.status, 201, JSON.stringify(created.body));
   assert.equal((await api.secadmin.post("/masters/suppliers", { supplierCode: "99999999", name: "X" })).status, 409);
   const m = await api.secadmin.post("/masters/materials", {
