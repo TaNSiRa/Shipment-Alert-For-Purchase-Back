@@ -128,7 +128,7 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
     await writeAudit({ actorId: user.id, action: "LOGIN_BLOCKED", entityType: "AUTH", entityId: typed, ...meta });
     noteIfExhausted(req);
     return res.status(401).json({
-      message: `Too many failed sign-ins. This account is locked for another ${minutes} minute${minutes === 1 ? "" : "s"}.`
+      message: `Too many failed sign-ins. This account is locked for another ${minutes} minute${minutes === 1 ? "" : "s"} — wait, or ask a system admin to unlock it.`
     });
   }
   if (!passwordOk) {
