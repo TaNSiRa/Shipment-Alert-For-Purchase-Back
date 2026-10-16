@@ -9,6 +9,7 @@ const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, regenerateSession, setLoggedInSession } = require("../../services/securityService");
 const { bumpTokenVersion, setMustChangePassword } = require("../../services/accountState");
+const { positionLabel } = require("../../services/orgService");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { getUserSections, requireAdmin } = require("../../services/sectionService");
 const { POLICY_VERSION, hasCurrentConsent } = require("../../services/pdpa");
@@ -43,8 +44,10 @@ registerLimiter(loginLimiter);
 
 const loginSchema = z.object({ email: z.string().min(1).max(255), password: z.string().min(1).max(256) });
 
-const USER_SELECT = `SELECT TOP 1 u.*, r.code AS role_code, r.name AS role_name
-  FROM users u JOIN roles r ON r.id = u.role_id`;
+const USER_SELECT = `SELECT TOP 1 u.*, r.code AS role_code, r.name AS role_name,
+    p.name AS position_name, p.abbreviation AS position_abbr
+  FROM users u JOIN roles r ON r.id = u.role_id
+  LEFT JOIN positions p ON p.id = u.position_id`;
 
 async function findActiveUserByIdentifier(identifier) {
   const value = `${identifier || ""}`.trim();
@@ -68,10 +71,16 @@ function sanitizeUser(user) {
     displayName: user.display_name,
     fullName: user.full_name,
     namePrefix: user.name_prefix,
+    branch: user.branch,
     department: user.department,
-    position: user.position,
+    section: user.section,
+    positionId: user.position_id,
+    positionName: user.position_name ?? null,
+    positionAbbr: user.position_abbr ?? null,
+    position: positionLabel(user.position_name, user.position_abbr) || user.position || null,
     phone: user.phone,
     avatar: user.avatar ?? null,
+    badgePhotoPos: user.badge_photo_pos ?? null,
     roleCode: user.role_code,
     roleName: user.role_name,
     receiveDailyMail: user.receive_daily_mail === true || user.receive_daily_mail === 1,
@@ -105,7 +114,8 @@ async function notifyAccountLocked(user, until, req) {
       lockedUntil: until,
       lockMinutes: LOCK_MINUTES,
       failures: MAX_FAILURES,
-      ip: req.ip
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
     });
     await sendMail({ to, subject: mail.subject, html: mail.html, type: mail.type });
   } catch (err) {
@@ -125,10 +135,13 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
   const locked = user ? lockedUntil(user) : null;
   if (locked && passwordOk) {
     const minutes = Math.max(1, Math.ceil((locked.getTime() - thaiWallNow().getTime()) / 60000));
-    await writeAudit({ actorId: user.id, action: "LOGIN_BLOCKED", entityType: "AUTH", entityId: typed, ...meta });
+    await writeAudit({
+      actorId: user.id, action: "LOGIN_BLOCKED", entityType: "AUTH", entityId: typed,
+      afterValue: { reason: "ACCOUNT_LOCKED", lockedUntil: locked.toISOString() }, ...meta
+    });
     noteIfExhausted(req);
     return res.status(401).json({
-      message: `Too many failed sign-ins. This account is locked for another ${minutes} minute${minutes === 1 ? "" : "s"}.`
+      message: `Too many failed sign-ins. This account is locked for another ${minutes} minute${minutes === 1 ? "" : "s"} — wait, or ask a system admin to unlock it.`
     });
   }
   if (!passwordOk) {
@@ -139,7 +152,10 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
     if (user) {
       const state = await recordFailure(user.id);
       if (state.locked) {
-        await writeAudit({ actorId: user.id, action: "ACCOUNT_LOCKED", entityType: "AUTH", entityId: typed, ...meta });
+        await writeAudit({
+          actorId: user.id, action: "ACCOUNT_LOCKED", entityType: "AUTH", entityId: typed,
+          afterValue: { failures: MAX_FAILURES, lockMinutes: LOCK_MINUTES }, ...meta
+        });
         if (!locked) await notifyAccountLocked(user, state.until, req);
       }
     }
@@ -186,8 +202,8 @@ router.get("/microsoft/callback", requireMicrosoft, asyncHandler(async (req, res
     email = microsoft.emailFromClaims(claims);
   } catch (err) {
     console.error(`[auth] Microsoft sign-in failed: ${err.message}`);
-    await writeAudit({ actorId: null, action: "LOGIN_FAILED", entityType: "AUTH", entityId: "microsoft",
-      afterValue: { reason: err.code || "MICROSOFT_ERROR", method: "MICROSOFT" }, ...meta });
+    await writeAudit({ actorId: null, action: "MICROSOFT_LOGIN_FAILED", entityType: "AUTH", entityId: "microsoft",
+      afterValue: { reason: err.code || "MICROSOFT_ERROR" }, ...meta });
     return back({ ms_error: "MICROSOFT_ERROR" });
   }
 
@@ -195,13 +211,13 @@ router.get("/microsoft/callback", requireMicrosoft, asyncHandler(async (req, res
   // Only an exact email match counts — the identifier lookup also accepts an
   // employee number, which a Microsoft account must never be matched by.
   if (!user || `${user.email || ""}`.trim().toLowerCase() !== email) {
-    await writeAudit({ actorId: null, action: "LOGIN_FAILED", entityType: "AUTH", entityId: `${email || "?"}`.slice(0, 100),
-      afterValue: { reason: "NO_SUCH_ACTIVE_USER", method: "MICROSOFT" }, ...meta });
+    await writeAudit({ actorId: null, action: "MICROSOFT_LOGIN_FAILED", entityType: "AUTH", entityId: `${email || "?"}`.slice(0, 100),
+      afterValue: { reason: "NO_SUCH_ACTIVE_USER" }, ...meta });
     return back({ ms_error: "NOT_REGISTERED" });
   }
   if (lockedUntil(user)) {
     await writeAudit({ actorId: user.id, action: "LOGIN_BLOCKED", entityType: "AUTH", entityId: email,
-      afterValue: { method: "MICROSOFT" }, ...meta });
+      afterValue: { reason: "ACCOUNT_LOCKED", method: "MICROSOFT" }, ...meta });
     return back({ ms_error: "LOCKED" });
   }
   back({ ms_ticket: microsoft.issueTicket(res, user.id) });
@@ -216,7 +232,7 @@ router.post("/microsoft/exchange", loginLimiter, requireMicrosoft, asyncHandler(
     return res.status(401).json({ message: "Microsoft sign-in expired. Please try again." });
   }
   await recordSuccess(user.id);
-  await writeAudit({ actorId: user.id, action: "LOGIN", entityType: "AUTH", afterValue: { method: "MICROSOFT" },
+  await writeAudit({ actorId: user.id, action: "MICROSOFT_LOGIN", entityType: "AUTH", entityId: user.email,
     ip: req.ip, userAgent: req.headers["user-agent"] });
   res.json(await completeLogin(req, user));
 }));

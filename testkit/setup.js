@@ -12,6 +12,7 @@ process.env.SQL_DATABASE = "Purchase_Alert_Test";
 process.env.MAIL_SCHEDULER_ENABLED = "false";
 process.env.SMTP_HOST = "";
 process.env.SMTP_FROM = "";
+process.env.HOLIDAY_SQL_SERVER = ""; // only the local holidays table in tests
 process.env.LOGIN_RATE_LIMIT_MAX = "1000";
 process.env.BCRYPT_ROUNDS = "4";
 process.env.NODE_ENV = "test";

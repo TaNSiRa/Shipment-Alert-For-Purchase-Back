@@ -1,5 +1,6 @@
 const { z } = require("zod");
 const { query } = require("../db/pool");
+const { getHolidayDates } = require("../db/holidayPool");
 const { toIso } = require("./dates");
 
 // Section settings, stored as strings in app_settings and served typed. The
@@ -117,9 +118,15 @@ function scheduleSettings(settings) {
   };
 }
 
+// Company holidays: the external holiday DB (SAR · Master_Holiday, as in RAP)
+// plus any extra days entered in Settings › Holidays.
 async function getHolidaySet() {
-  const rows = (await query("SELECT holiday_date FROM holidays")).recordset;
-  return new Set(rows.map(r => toIso(r.holiday_date)));
+  const year = new Date().getFullYear();
+  const [rows, external] = await Promise.all([
+    query("SELECT holiday_date FROM holidays"),
+    getHolidayDates(`${year - 3}-01-01`, `${year + 3}-12-31`)
+  ]);
+  return new Set([...rows.recordset.map(r => toIso(r.holiday_date)), ...external.dates]);
 }
 
 const settingsUpdateSchema = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]));

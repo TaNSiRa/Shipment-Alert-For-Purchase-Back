@@ -65,6 +65,40 @@ router.get("/mail/status", requireSectionAdmin, asyncHandler(async (req, res) =>
   });
 }));
 
+// The section's members with their "receive the daily email" switch, so an
+// admin can set it for anyone — the same flag each person has in Profile.
+router.get("/mail/members", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const rows = (await query(
+    `SELECT u.id, u.display_name, u.email, u.receive_daily_mail, r.code AS role_code, r.name AS role_name
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1
+     WHERE u.is_active = 1
+     ORDER BY CASE r.code WHEN 'ADMIN' THEN 0 WHEN 'SECTION_ADMIN' THEN 1 WHEN 'USER' THEN 2 ELSE 3 END, u.display_name`,
+    { sectionId: req.section.id }
+  )).recordset;
+  res.json({ data: rows.map(r => ({
+    id: r.id, displayName: r.display_name, email: r.email, roleCode: r.role_code, roleName: r.role_name,
+    hasEmail: `${r.email || ""}`.includes("@"),
+    receiveDailyMail: r.receive_daily_mail === true || r.receive_daily_mail === 1
+  })) });
+}));
+
+router.patch("/mail/members/:userId(\\d+)", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const input = z.object({ receiveDailyMail: z.boolean() }).parse(req.body);
+  const userId = Number(req.params.userId);
+  const r = await query(
+    `UPDATE u SET receive_daily_mail = @on, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
+     FROM users u
+     JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1
+     WHERE u.id = @userId AND u.is_active = 1`,
+    { userId, sectionId: req.section.id, on: input.receiveDailyMail ? 1 : 0 }
+  );
+  if (!r.rowsAffected[0]) return res.status(404).json({ message: "Not a member of this section" });
+  await audit(req, "EDIT", "MAIL_RECIPIENT", userId, input);
+  res.json({ ok: true });
+}));
+
 router.post("/mail/test", requireSectionAdmin, asyncHandler(async (req, res) => {
   const me = (await query("SELECT email, display_name FROM users WHERE id = @id", { id: req.user.id })).recordset[0];
   const mail = buildTestEmail({ name: me.display_name });
@@ -102,12 +136,17 @@ router.post("/mail/send-now", requireSectionAdmin, asyncHandler(async (req, res)
 }));
 
 router.get("/outbox", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 50, 1), 200);
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const params = { sectionId: req.section.id, offset: (page - 1) * pageSize, pageSize };
+  const total = (await query("SELECT COUNT(1) AS n FROM email_outbox WHERE section_id = @sectionId", params)).recordset[0].n;
   const rows = (await query(
-    `SELECT TOP 100 id, mail_type, to_email, subject, status, error_message, created_at, sent_at
-     FROM email_outbox WHERE section_id = @sectionId ORDER BY id DESC`,
-    { sectionId: req.section.id }
+    `SELECT id, mail_type, to_email, subject, status, error_message, created_at, sent_at
+     FROM email_outbox WHERE section_id = @sectionId
+     ORDER BY id DESC OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY`,
+    params
   )).recordset;
-  res.json({ data: rows.map(r => ({
+  res.json({ total, page, pageSize, data: rows.map(r => ({
     id: r.id, type: r.mail_type, to: r.to_email, subject: r.subject, status: r.status,
     error: r.status === "failed" ? `${r.error_message || ""}`.slice(0, 300) : null,
     createdAt: wallTime(r.created_at), sentAt: wallTime(r.sent_at)

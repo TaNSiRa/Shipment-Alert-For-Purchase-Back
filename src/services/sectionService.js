@@ -3,8 +3,8 @@ const { query } = require("../db/pool");
 // Roles stack with section memberships, like RAP:
 //   ADMIN          — everything, every section, system settings.
 //   SECTION_ADMIN  — with is_section_admin on a membership: manages that
-//                    section's users (USER / VIEWER only), masters, workflow
-//                    and settings. Everywhere else it is a plain member.
+//                    section's users (anyone but a global ADMIN), masters,
+//                    workflow and settings. Everywhere else it is a plain member.
 //   USER           — imports POs and moves them through the workflow, in the
 //                    sections where the membership has can_edit.
 //   VIEWER         — read-only, in the sections it is a member of.
@@ -26,10 +26,10 @@ function isViewer(user) {
 }
 
 // Privilege-escalation guard: a global admin manages anyone; a section admin
-// only plain USER / VIEWER accounts — never another admin.
+// manages section admins, users and viewers — never a global admin.
 function canManageTargetRole(actor, targetRoleCode) {
   if (isAdmin(actor)) return true;
-  return targetRoleCode === "USER" || targetRoleCode === "VIEWER";
+  return targetRoleCode === "SECTION_ADMIN" || targetRoleCode === "USER" || targetRoleCode === "VIEWER";
 }
 
 function bit(value) {

@@ -10,7 +10,7 @@
 // The version people are being asked to agree to right now. Raising this asks
 // everyone for consent again, which is the point of R10.5: consent is given to
 // a specific text, so a new text needs a new answer.
-const POLICY_VERSION = "psa-privacy-policy-2026";
+const POLICY_VERSION = "psa-privacy-policy-2026-10";
 
 // Endpoints that must stay open to a signed-in account that has NOT consented
 // yet — otherwise there is no way to reach the consent page or to leave.

@@ -2,13 +2,14 @@ const express = require("express");
 const { z } = require("zod");
 const { env } = require("../../config/env");
 const { query } = require("../../db/pool");
+const { holidayDbSettings, listExternalHolidays, saveHolidayDbSettings, verifyHoliday } = require("../../db/holidayPool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { writeAudit } = require("../../middleware/audit");
 const { requireAdmin } = require("../../services/sectionService");
 const { insertDefaultSteps } = require("../../services/workflowService");
 const { isMailConfigured, verifyMail } = require("../../services/mailService");
 const { emitAll } = require("../../services/realtimeService");
-const { isIsoDate, toIso } = require("../../services/dates");
+const { isIsoDate, toIso, todayIso } = require("../../services/dates");
 const { wallTime } = require("../../services/serialize");
 
 // System-admin only: sections, company holidays, system status, global log.
@@ -105,21 +106,30 @@ router.patch("/sections/:id(\\d+)", asyncHandler(async (req, res) => {
 
 // ---- Holidays ----------------------------------------------------------------
 
+// One year's holidays from both sources: the days added here (removable) and
+// the holiday database's (read-only — it is shared with RAP).
 router.get("/holidays", asyncHandler(async (req, res) => {
-  const year = Number(req.query.year) || null;
+  const year = Number(req.query.year) || Number(todayIso().slice(0, 4));
   const rows = (await query(
-    `SELECT id, holiday_date, name FROM holidays
-     WHERE @year IS NULL OR YEAR(holiday_date) = @year ORDER BY holiday_date`,
+    "SELECT id, holiday_date, name FROM holidays WHERE YEAR(holiday_date) = @year ORDER BY holiday_date",
     { year }
   )).recordset;
-  res.json({ data: rows.map(r => ({ id: r.id, date: toIso(r.holiday_date), name: r.name })) });
+  const local = rows.map(r => ({ id: r.id, date: toIso(r.holiday_date), name: r.name, source: "local" }));
+  const external = await listExternalHolidays(`${year}-01-01`, `${year}-12-31`);
+  const localDates = new Set(local.map(h => h.date));
+  const data = [
+    ...local,
+    ...external.rows.filter(h => !localDates.has(h.date)).map(h => ({ id: null, ...h, source: "external" }))
+  ].sort((a, b) => a.date.localeCompare(b.date));
+  res.json({ year, externalConfigured: external.configured, data });
 }));
 
 router.post("/holidays", asyncHandler(async (req, res) => {
   const items = z.array(z.object({
     date: z.string().refine(isIsoDate, "Invalid date"),
-    name: z.string().trim().min(1).max(150)
-  })).min(1).max(100).parse(Array.isArray(req.body) ? req.body : [req.body]);
+    name: z.string().trim().max(150).optional().default("")
+  })).min(1).max(100).parse(Array.isArray(req.body) ? req.body : [req.body])
+    .map(h => ({ ...h, name: h.name || "Company holiday" }));
   let added = 0;
   for (const h of items) {
     const r = await query(
@@ -129,7 +139,9 @@ router.post("/holidays", asyncHandler(async (req, res) => {
     );
     added += r.rowsAffected?.[0] || 0;
   }
+  if (!added) return res.status(409).json({ message: items.length === 1 ? `${items[0].date} is already a holiday` : "These days are already holidays" });
   await audit(req, "CREATE", "HOLIDAY", items.map(i => i.date).join(",").slice(0, 120), items);
+  emitAll("settings.updated");
   res.json({ ok: true, added });
 }));
 
@@ -138,6 +150,29 @@ router.delete("/holidays/:id(\\d+)", asyncHandler(async (req, res) => {
   if (!r.rowsAffected[0]) return res.status(404).json({ message: "Holiday not found" });
   await audit(req, "DELETE", "HOLIDAY", req.params.id);
   res.json({ ok: true });
+}));
+
+// External holiday DB (SAR · Master_Holiday), as in RAP. Credentials stay in
+// .env; host/database/table/enabled are edited here.
+router.get("/holiday-db", asyncHandler(async (req, res) => {
+  res.json(await holidayDbSettings());
+}));
+
+router.put("/holiday-db", asyncHandler(async (req, res) => {
+  const ident = z.string().trim().max(128).regex(/^[A-Za-z0-9_]*$/, "Letters, digits and _ only");
+  const input = z.object({
+    host: z.string().trim().max(255).regex(/^[A-Za-z0-9._\\:-]*$/, "Not a valid host"),
+    database: ident,
+    table: ident,
+    enabled: z.boolean()
+  }).parse(req.body);
+  await saveHolidayDbSettings(input, req.user.id);
+  await audit(req, "EDIT", "HOLIDAY_DB", null, input);
+  res.json(await holidayDbSettings());
+}));
+
+router.get("/holiday-db/verify", asyncHandler(async (req, res) => {
+  res.json(await verifyHoliday());
 }));
 
 // ---- Whole-system activity log -------------------------------------------------
@@ -152,7 +187,7 @@ router.get("/audit", asyncHandler(async (req, res) => {
     where.push("(a.action LIKE @q OR a.entity_type LIKE @q OR a.entity_id LIKE @q OR u.display_name LIKE @q OR a.ip_address LIKE @q)");
   }
   if (req.query.security === "true") {
-    where.push("a.action IN ('LOGIN','LOGIN_FAILED','ACCOUNT_LOCKED','LOGIN_BLOCKED','LOGOUT','CHANGE_PASSWORD','RESET_PASSWORD','UNLOCK_ACCOUNT','UNBLOCK_LOGIN','UNBLOCK_LOGIN_ALL')");
+    where.push("a.action IN ('LOGIN','LOGIN_FAILED','MICROSOFT_LOGIN','MICROSOFT_LOGIN_FAILED','ACCOUNT_LOCKED','LOGIN_BLOCKED','LOGOUT','CHANGE_PASSWORD','RESET_PASSWORD','UNLOCK_ACCOUNT','UNBLOCK_LOGIN','UNBLOCK_LOGIN_ALL')");
   }
   const total = (await query(`SELECT COUNT(1) AS n FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id WHERE ${where.join(" AND ")}`, params)).recordset[0].n;
   const rows = (await query(

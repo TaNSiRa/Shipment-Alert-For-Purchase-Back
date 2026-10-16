@@ -10,6 +10,7 @@ const { bumpTokenVersion, setMustChangePassword } = require("../../services/acco
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { setLoggedInSession } = require("../../services/securityService");
 const { getUserSections } = require("../../services/sectionService");
+const { assertPositionExists, getOrgOptions } = require("../../services/orgService");
 const { wallTime } = require("../../services/serialize");
 const { findActiveUserById, sanitizeUser } = require("../auth/auth.routes");
 
@@ -21,7 +22,11 @@ const profileSchema = z.object({
   displayName: z.string().trim().min(1).max(150).optional(),
   fullName: editText(200),
   namePrefix: editText(20),
+  branch: editText(100),
   department: editText(100),
+  section: editText(100),
+  positionId: z.number().int().positive().optional().nullable(),
+  // Free-text position from before the positions list; still accepted.
   position: editText(100),
   phone: editText(50),
   receiveDailyMail: z.boolean().optional()
@@ -38,11 +43,17 @@ async function freshUser(id) {
   return user;
 }
 
+// Dropdown lists for the Department / Position fields (same lists as RAP).
+router.get("/org-options", asyncHandler(async (req, res) => {
+  res.json(await getOrgOptions());
+}));
+
 router.patch("/", asyncHandler(async (req, res) => {
   const input = profileSchema.parse(req.body);
+  await assertPositionExists(input.positionId);
   const columns = {
     displayName: "display_name", fullName: "full_name", namePrefix: "name_prefix",
-    department: "department", position: "position", phone: "phone"
+    branch: "branch", department: "department", section: "section", positionId: "position_id", position: "position", phone: "phone"
   };
   const sets = [];
   const params = { id: req.user.id };
@@ -86,6 +97,23 @@ router.put("/avatar", asyncHandler(async (req, res) => {
   res.json({ user: await freshUser(req.user.id) });
 }));
 
+// Where that picture sits on the employee badge: "dx,dy,zoom" as dragged on
+// the card, or null for the centred default. Its own endpoint because it is
+// saved the moment a drag ends, not through the profile form.
+router.put("/badge-photo", asyncHandler(async (req, res) => {
+  const input = z.object({
+    // Two offsets and a scale, nothing else — written straight into a column
+    // and read back into a layout.
+    placement: z.string()
+      .regex(/^-?\d{1,4}(\.\d{1,2})?,-?\d{1,4}(\.\d{1,2})?,\d{1,2}(\.\d{1,3})?$/, "Placement must be \"dx,dy,zoom\"")
+      .nullable()
+  }).parse(req.body);
+  await query("UPDATE users SET badge_photo_pos = @placement, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @id", {
+    id: req.user.id, placement: input.placement
+  });
+  res.json({ user: await freshUser(req.user.id) });
+}));
+
 router.patch("/password", asyncHandler(async (req, res) => {
   const input = z.object({ currentPassword: z.string().min(1).max(256), newPassword: z.string().min(1).max(256) }).parse(req.body);
   const row = (await query("SELECT password_hash FROM users WHERE id = @id AND is_active = 1", { id: req.user.id })).recordset[0];
@@ -109,7 +137,7 @@ router.patch("/password", asyncHandler(async (req, res) => {
 router.get("/activity", asyncHandler(async (req, res) => {
   const rows = (await query(
     `SELECT TOP 30 action, entity_type, ip_address, user_agent, created_at FROM audit_logs
-     WHERE actor_user_id = @id AND action IN ('LOGIN','LOGOUT','LOGIN_FAILED','ACCOUNT_LOCKED','CHANGE_PASSWORD','EDIT_PROFILE','EDIT_AVATAR','PDPA_ACCEPT')
+     WHERE actor_user_id = @id AND action IN ('LOGIN','MICROSOFT_LOGIN','LOGOUT','LOGIN_FAILED','LOGIN_BLOCKED','ACCOUNT_LOCKED','CHANGE_PASSWORD','EDIT_PROFILE','EDIT_AVATAR','PDPA_ACCEPT')
      ORDER BY created_at DESC`,
     { id: req.user.id }
   )).recordset;

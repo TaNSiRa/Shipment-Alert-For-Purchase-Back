@@ -87,7 +87,7 @@ const env = {
     cookieName: process.env.SESSION_COOKIE_NAME || "psa_session",
     cookieSecure: boolEnv("SESSION_COOKIE_SECURE"),
     cookieSameSite: sameSite,
-    idleTimeoutMinutes: numberEnv("SESSION_IDLE_TIMEOUT_MINUTES", 30)
+    idleTimeoutMinutes: numberEnv("SESSION_IDLE_TIMEOUT_MINUTES", 15)
   },
   sql: {
     server: process.env.SQL_SERVER || "127.0.0.1",
@@ -107,6 +107,22 @@ const env = {
     user: process.env.SMTP_USER || "",
     password: process.env.SMTP_PASSWORD || "",
     from: process.env.SMTP_FROM || ""
+  },
+  // Read-only external DB holding company holidays (the SAR system's
+  // Master_Holiday table), same as RAP. Host/database/table can be overridden
+  // in Settings › Holidays; credentials and port live here only.
+  holiday: {
+    server: process.env.HOLIDAY_SQL_SERVER || "",
+    port: numberEnv("HOLIDAY_SQL_PORT", 1433),
+    database: process.env.HOLIDAY_SQL_DATABASE || "",
+    user: process.env.HOLIDAY_SQL_USER || "",
+    password: process.env.HOLIDAY_SQL_PASSWORD || "",
+    table: process.env.HOLIDAY_SQL_TABLE || "Master_Holiday",
+    dateColumn: process.env.HOLIDAY_SQL_DATE_COLUMN || "HolidayDate",
+    options: {
+      encrypt: boolEnv("HOLIDAY_SQL_ENCRYPT"),
+      trustServerCertificate: boolEnv("HOLIDAY_SQL_TRUST_SERVER_CERTIFICATE", true)
+    }
   }
 };
 
