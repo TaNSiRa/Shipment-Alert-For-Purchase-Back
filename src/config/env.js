@@ -62,7 +62,7 @@ if (microsoft.enabled && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 const env = {
   nodeEnv: process.env.NODE_ENV || "development",
   apiHost: process.env.API_HOST || "127.0.0.1",
-  apiPort: numberEnv("API_PORT", 4340),
+  apiPort: numberEnv("API_PORT", 3401),
   frontendOrigins: listEnv("FRONTEND_ORIGINS"),
   appPublicUrl: process.env.APP_PUBLIC_URL || "",
   jwtSecret,
