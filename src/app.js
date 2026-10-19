@@ -1,4 +1,4 @@
-// The Express app, split from server.js so tests can drive the full API
+// The Express app, split from Purchase-Alert.js so tests can drive the full API
 // in-process (supertest) without opening a port or starting the scheduler.
 //
 // Request pipeline (same order as RAP):

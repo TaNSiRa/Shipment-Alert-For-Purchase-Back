@@ -130,16 +130,18 @@ async function readSheets(buffer) {
   return { sheets, suppliers, materials, materialRows, supplierRows, skipped, notes };
 }
 
-// Works out what an import would do, without writing.
+// Works out what an import would do, without writing. Inside a transaction both
+// reads must go through the runner: a pool query would wait on the rows the
+// transaction itself just inserted and hang until the request timeout.
 async function plan(sectionId, parsed, runner = { query }) {
-  const [sRows, mRows] = await Promise.all([
-    runner.query("SELECT id, supplier_code, name, short_name FROM suppliers WHERE section_id = @sectionId", { sectionId }),
-    query(
-      `SELECT m.id, s.supplier_code, m.material_code, m.material_type, m.vendor_material, m.description, m.lead_time_days
-       FROM materials m LEFT JOIN suppliers s ON s.id = m.supplier_id WHERE m.section_id = @sectionId`,
-      { sectionId }
-    )
-  ]);
+  const sRows = await runner.query(
+    "SELECT id, supplier_code, name, short_name FROM suppliers WHERE section_id = @sectionId", { sectionId }
+  );
+  const mRows = await runner.query(
+    `SELECT m.id, s.supplier_code, m.material_code, m.material_type, m.vendor_material, m.description, m.lead_time_days
+     FROM materials m LEFT JOIN suppliers s ON s.id = m.supplier_id WHERE m.section_id = @sectionId`,
+    { sectionId }
+  );
   const supplierByCode = new Map(sRows.recordset.map(s => [`${s.supplier_code}`, s]));
   const materialByKey = new Map();
   for (const m of mRows.recordset) {

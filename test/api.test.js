@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const request = require("supertest");
 const { addDays, todayIso } = require("../src/services/dates");
 const { tick } = require("../src/services/mailScheduler");
+const { buildSheet } = require("../src/services/excelKit");
 
 let ctx;
 const tokens = {};
@@ -39,6 +40,27 @@ test("master import is idempotent and merges duplicates", async () => {
   assert.equal(preview.status, 200, JSON.stringify(preview.body));
   assert.equal(preview.body.materialsNew, 0);
   assert.equal(preview.body.suppliersNew, 0);
+});
+
+test("master import commits a new supplier together with its material", async () => {
+  const buffer = await buildSheet({
+    sheetName: "Material Master",
+    columns: [
+      { header: "Supplier ID", key: "code" }, { header: "Supplier Name", key: "name" },
+      { header: "Material Code", key: "mat" }, { header: "Leadtime (Days)", key: "lt", type: "number" }
+    ],
+    rows: [{ code: "88888888", name: "IMPORT TEST SUPPLIER", mat: "9999999", lt: 30 }]
+  });
+  const data = Buffer.from(buffer).toString("base64");
+  try {
+    const res = await api.secadmin.post("/masters/import/commit", { data, fileName: "new-supplier.xlsx" });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.suppliersNew, 1);
+    assert.equal(res.body.materialsNew, 1);
+  } finally {
+    await query(`DELETE m FROM materials m JOIN suppliers s ON s.id = m.supplier_id WHERE s.supplier_code = '88888888'`);
+    await query("DELETE FROM suppliers WHERE supplier_code = '88888888'");
+  }
 });
 
 test("SAP export preview groups lines into POs and matches the masters", async () => {
