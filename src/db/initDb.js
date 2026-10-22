@@ -3,6 +3,15 @@ const path = require("path");
 const sql = require("mssql");
 const { env } = require("../config/env");
 
+// Runs database/schema.sql batch by batch through runQuery(text). Every batch
+// is guarded (IF ... IS NULL), so it is safe on a database already up to date.
+async function applySchema(runQuery) {
+  const schema = fs.readFileSync(path.resolve(__dirname, "../../../database/schema.sql"), "utf8").replace(/^﻿/, "");
+  const batches = schema.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
+  for (const batch of batches) await runQuery(batch);
+  return batches.length;
+}
+
 // Creates the database when missing and applies database/schema.sql (which is
 // idempotent), then makes sure every section has its workflow steps.
 async function initDatabase({ log = console.log } = {}) {
@@ -23,10 +32,8 @@ async function initDatabase({ log = console.log } = {}) {
 
   const pool = await new sql.ConnectionPool({ ...base, database: dbName }).connect();
   try {
-    const schema = fs.readFileSync(path.resolve(__dirname, "../../../database/schema.sql"), "utf8").replace(/^﻿/, "");
-    const batches = schema.split(/^\s*GO\s*$/im).map(b => b.trim()).filter(Boolean);
-    for (const batch of batches) await pool.request().query(batch);
-    log(`Schema applied (${batches.length} batches)`);
+    const count = await applySchema(text => pool.request().query(text));
+    log(`Schema applied (${count} batches)`);
 
     const { insertDefaultSteps } = require("../services/workflowService");
     const runner = {
@@ -48,4 +55,4 @@ async function initDatabase({ log = console.log } = {}) {
   }
 }
 
-module.exports = { initDatabase };
+module.exports = { applySchema, initDatabase };
