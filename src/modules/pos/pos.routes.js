@@ -60,7 +60,7 @@ router.get("/import/batches", asyncHandler(async (req, res) => {
   const params = { sectionId: req.section.id, offset: (page - 1) * pageSize, pageSize };
   const total = (await query("SELECT COUNT(1) AS n FROM import_batches WHERE section_id = @sectionId", params)).recordset[0].n;
   const rows = (await query(
-    `SELECT b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_skipped, b.items_created,
+    `SELECT b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_updated, b.po_skipped, b.items_created,
             b.created_at, u.display_name, CAST(CASE WHEN b.file_data IS NULL THEN 0 ELSE 1 END AS BIT) AS has_file,
             DATALENGTH(b.file_data) AS file_size
      FROM import_batches b LEFT JOIN users u ON u.id = b.uploaded_by
@@ -69,7 +69,7 @@ router.get("/import/batches", asyncHandler(async (req, res) => {
   )).recordset;
   res.json({ total, page, pageSize, data: rows.map(r => ({
     id: r.id, fileName: r.file_name, sheetName: r.sheet_name, totalRows: r.total_rows, created: r.po_created,
-    skipped: r.po_skipped, items: r.items_created, uploadedBy: r.display_name,
+    updated: r.po_updated || 0, skipped: r.po_skipped, items: r.items_created, uploadedBy: r.display_name,
     createdAt: r.created_at ? new Date(r.created_at).toISOString().slice(0, 19) : null,
     hasFile: r.has_file === true || r.has_file === 1, fileSize: r.file_size
   })) });
@@ -188,7 +188,10 @@ router.get("/roadmap", asyncHandler(async (req, res) => {
 
 router.get("/:id(\\d+)", asyncHandler(async (req, res) => {
   const ctx = await loadContext(req.section.id);
-  res.json({ data: await getPoDetail(Number(req.params.id), req.section.id, ctx) });
+  const po = await getPoDetail(Number(req.params.id), req.section.id, ctx);
+  // Which SAP columns of each line are PO-wide (read-only in the line editor).
+  for (const item of po.items) item.rawLocked = poImport.lockedHeaders(item.raw);
+  res.json({ data: po });
 }));
 
 // ---- Writes ----------------------------------------------------------------
@@ -301,9 +304,10 @@ router.post("/import/commit", requireEditor, asyncHandler(async (req, res) => {
   const ctx = await loadContext(req.section.id);
   const result = await poImport.commit(req.section.id, input, req.user, ctx);
   await audit(req, "IMPORT", result.batchId, {
-    fileName: input.fileName, created: result.created.length, skipped: result.skipped, suppliersAdded: result.suppliersAdded
+    fileName: input.fileName, created: result.created.length, updated: result.updated.length,
+    skipped: result.skipped, suppliersAdded: result.suppliersAdded
   });
-  changed(req, result.created.map(c => c.id));
+  changed(req, [...result.created, ...result.updated].map(c => c.id));
   res.json(result);
 }));
 
@@ -392,6 +396,22 @@ router.patch("/:id(\\d+)", requireEditor, asyncHandler(async (req, res) => {
   const result = await updatePo(Number(req.params.id), req.section.id, input, req.user, ctx);
   if (result.changed) {
     await audit(req, "EDIT", req.params.id, input);
+    changed(req, [result.id]);
+  }
+  res.json(result);
+}));
+
+// One line's SAP columns edited by hand (the "all columns" view).
+router.patch("/:id(\\d+)/items/:itemId(\\d+)", requireEditor, asyncHandler(async (req, res) => {
+  const { values } = z.object({
+    values: z.record(z.string().max(100), z.union([z.string().max(255), z.number()]).nullable())
+  }).parse(req.body);
+  const ctx = await loadContext(req.section.id);
+  const result = await poImport.updateItem(
+    Number(req.params.id), Number(req.params.itemId), req.section.id, values, req.user, ctx
+  );
+  if (result.changed) {
+    await audit(req, "EDIT_ITEM", req.params.id, { itemId: result.itemId, values });
     changed(req, [result.id]);
   }
   res.json(result);

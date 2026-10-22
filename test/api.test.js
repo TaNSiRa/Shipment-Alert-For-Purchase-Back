@@ -109,6 +109,100 @@ test("viewer cannot import; import commit creates POs once", async () => {
   assert.equal(po.etaDate, addDays("2026-02-20", po.leadTimeDays));
 });
 
+test("a stored SAP line is edited column by column; PO-wide columns stay locked", async () => {
+  const po = (await api.viewer.get("/pos?q=1910000453")).body.data.find(p => p.poNo === "1910000453");
+  const detail = (await api.viewer.get(`/pos/${po.id}`)).body.data;
+  const item = detail.items.find(i => i.raw && "Order Quantity" in i.raw && "Net Price" in i.raw);
+  assert.ok(item.rawLocked.includes("Purchasing Document"));
+  assert.ok(!item.rawLocked.includes("Order Quantity"));
+  const url = `/pos/${po.id}/items/${item.id}`;
+  assert.equal((await api.viewer.patch(url, { values: { "Order Quantity": "5" } })).status, 403);
+  assert.equal((await api.buyer.patch(url, { values: { "Purchasing Document": "1" } })).status, 400);
+  assert.equal((await api.buyer.patch(url, { values: { "Net Price": "abc" } })).status, 400);
+  const res = await api.buyer.patch(url, { values: { "Order Quantity": "5", "Net Price": "100", "Short Text": "EDITED TEXT" } });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.changed, true);
+  const after = (await api.viewer.get(`/pos/${po.id}`)).body.data;
+  const line = after.items.find(i => i.id === item.id);
+  assert.equal(line.orderQty, 5);
+  assert.equal(line.netPrice, 100);
+  assert.equal(line.shortText, "EDITED TEXT");
+  assert.equal(line.raw["Order Quantity"], 5);
+  assert.equal(line.raw["Short Text"], "EDITED TEXT");
+  const expected = after.items.filter(i => !i.deleted).reduce((s, i) => s + (i.orderQty || 0) * (i.netPrice || 0), 0);
+  assert.equal(after.totalValue, expected);
+  assert.equal(after.history[0].action, "ITEM_EDITED");
+  assert.equal(after.history[0].detail.changes["Order Quantity"].to, 5);
+  const same = await api.buyer.patch(url, { values: { "Order Quantity": "5" } });
+  assert.equal(same.body.changed, false);
+});
+
+// The SAP export with some cells of one PO changed, as a re-export would bring.
+async function editedSapFile(poNo, edits) {
+  const ExcelJS = require("exceljs");
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(require("fs").readFileSync(SAP_FILE));
+  const ws = wb.worksheets[0];
+  const header = {};
+  ws.getRow(1).eachCell((cell, col) => { header[`${cell.value}`.trim()] = col; });
+  const rows = [];
+  ws.eachRow((row, r) => { if (r > 1 && `${row.getCell(header["Purchasing Document"]).value}` === poNo) rows.push(row); });
+  edits(rows, header);
+  return Buffer.from(await wb.xlsx.writeBuffer()).toString("base64");
+}
+
+test("re-import: changed cells of an existing PO are shown and applied only when chosen", async () => {
+  // Line 1 of 1910000453 was edited in the app by the test above; line 2 is
+  // changed in the file.
+  let editedItemNo;
+  const data = await editedSapFile("1910000453", (rows, h) => {
+    rows[1].getCell(h["Order Quantity"]).value = 999;
+    editedItemNo = `${rows[1].getCell(h.Item).value}`;
+  });
+  const preview = await api.buyer.post("/pos/import/preview", { data });
+  assert.equal(preview.status, 200, JSON.stringify(preview.body));
+  const p = preview.body.pos.find(x => x.poNo === "1910000453");
+  assert.equal(p.status, "CHANGED", JSON.stringify(p.errors));
+  assert.equal(preview.body.summary.changed, 1);
+  assert.equal(p.changes.po.length, 0);
+  const line = p.changes.lines.find(l => l.kind === "CHANGED" && l.itemNo === editedItemNo);
+  assert.deepEqual(line.columns.map(c => c.header), ["Order Quantity"]);
+  assert.equal(line.columns[0].to, 999);
+  // The in-app edit differs from the file too, and is shown as such.
+  const appEdited = p.changes.lines.find(l => l.kind === "CHANGED" && l.itemNo !== editedItemNo);
+  assert.ok(appEdited.columns.some(c => c.header === "Short Text" && c.from === "EDITED TEXT"));
+  assert.equal(p.changes.pairs, undefined);
+  // Unchanged PO of the same file stays EXISTS.
+  assert.equal(preview.body.pos.find(x => x.poNo === "1910000451").status, "EXISTS");
+
+  // An unchanged PO alone is nothing to import; a CHANGED one is only applied when named.
+  const id = (await api.viewer.get("/pos?q=1910000453")).body.data[0].id;
+  const before = (await api.viewer.get(`/pos/${id}`)).body.data;
+  const noop = await api.buyer.post("/pos/import/commit", { data, poNos: ["1910000451"] });
+  assert.equal(noop.status, 400);
+
+  const res = await api.buyer.post("/pos/import/commit", { data, fileName: "re-export.xlsx", poNos: ["1910000453"] });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.updated.length, 1);
+  assert.equal(res.body.created.length, 0);
+  const after = (await api.viewer.get(`/pos/${id}`)).body.data;
+  const changedItem = after.items.find(i => i.id === before.items.find(b => b.itemNo === editedItemNo).id);
+  assert.equal(changedItem.orderQty, 999);
+  assert.equal(changedItem.raw["Order Quantity"], 999);
+  const reverted = after.items.find(i => i.itemNo === appEdited.itemNo);
+  assert.equal(reverted.shortText, appEdited.columns.find(c => c.header === "Short Text").to);
+  assert.equal(after.items.length, before.items.length);
+  assert.equal(after.currentStep, before.currentStep);
+  const h = after.history.find(x => x.action === "IMPORT_UPDATED");
+  assert.ok(h);
+  assert.equal(h.detail.lines.find(l => l.itemNo === editedItemNo).changes["Order Quantity"].to, 999);
+
+  const again = await api.buyer.post("/pos/import/preview", { data });
+  assert.equal(again.body.pos.find(x => x.poNo === "1910000453").status, "EXISTS");
+  const batch = (await api.viewer.get("/pos/import/batches")).body.data[0];
+  assert.equal(batch.updated, 1);
+});
+
 test("advance: validation, optimistic step check, re-plan from actual dates", async () => {
   const id = await makePo("T-ADV-1", addDays(todayIso(), -30));
   const before = (await api.buyer.get(`/pos/${id}`)).body.data;
@@ -454,6 +548,25 @@ test("account lockout after 5 wrong passwords, admin unlock", async () => {
   assert.ok(b2.lockedUntil);
   assert.equal((await api.secadmin.post(`/users/${b2.id}/unlock`)).status, 200);
   assert.equal((await request(app).post("/api/auth/login").send({ email: "buyer2@test.local", password: PASSWORD })).status, 200);
+});
+
+test("once a lock runs out, the failure count starts over", async () => {
+  const email = "buyer2@test.local";
+  const state = async () => (await query(
+    "SELECT failed_login_count AS failures, login_locked_until AS until FROM users WHERE email = @email", { email }
+  )).recordset[0];
+  // Locked after 5 failures, and the 15 minutes have passed.
+  await query(
+    `UPDATE users SET failed_login_count = 5,
+       login_locked_until = DATEADD(MINUTE, -1, DATEADD(HOUR, 7, SYSUTCDATETIME()))
+     WHERE email = @email`,
+    { email }
+  );
+  const typo = await request(app).post("/api/auth/login").send({ email, password: "wrong-password" });
+  assert.equal(typo.status, 401);
+  assert.deepEqual(await state(), { failures: 1, until: null }, "one typo after the lock must not lock again");
+  assert.equal((await request(app).post("/api/auth/login").send({ email, password: PASSWORD })).status, 200);
+  assert.deepEqual(await state(), { failures: 0, until: null });
 });
 
 test("CSRF: a cookie session must send the CSRF token on writes", async () => {

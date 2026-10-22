@@ -34,6 +34,49 @@ async function addHistory(runner, poId, action, { stepNo = null, detail = null, 
   );
 }
 
+// One PO line (shape as in createPo's items). Also used when a re-import adds
+// a line to a PO that already exists.
+async function insertItem(runner, poId, item) {
+  await runner.query(
+    `INSERT INTO po_items (po_id, item_no, material_id, material_code, short_text, vendor_material, material_type,
+       material_group, order_qty, order_unit, net_price, currency, qty_sku, sku_unit, lead_time_days,
+       po_history_release, doc_category, order_price_unit, price_unit, still_to_invoice_qty, still_to_invoice_val,
+       deletion_indicator, item_category, acct_assignment_cat, source_row, raw_data)
+     VALUES (@poId, @itemNo, @materialId, @materialCode, @shortText, @vendorMaterial, @materialType,
+       @materialGroup, @orderQty, @orderUnit, @netPrice, @currency, @qtySku, @skuUnit, @leadTimeDays,
+       @poHistory, @docCategory, @orderPriceUnit, @priceUnit, @stillQty, @stillVal,
+       @deletionIndicator, @itemCategory, @acctAssignment, @sourceRow, @raw)`,
+    {
+      poId,
+      itemNo: item.itemNo || null,
+      materialId: item.materialId || null,
+      materialCode: item.materialCode || null,
+      shortText: item.shortText || null,
+      vendorMaterial: item.vendorMaterial || null,
+      materialType: item.materialType || null,
+      materialGroup: item.materialGroup || null,
+      orderQty: num(item.orderQty),
+      orderUnit: item.orderUnit || null,
+      netPrice: num(item.netPrice),
+      currency: item.currency || null,
+      qtySku: num(item.qtySku),
+      skuUnit: item.skuUnit || null,
+      leadTimeDays: num(item.leadTimeDays),
+      poHistory: item.poHistory || null,
+      docCategory: item.docCategory || null,
+      orderPriceUnit: item.orderPriceUnit || null,
+      priceUnit: num(item.priceUnit),
+      stillQty: num(item.stillQty),
+      stillVal: num(item.stillVal),
+      deletionIndicator: item.deletionIndicator || null,
+      itemCategory: item.itemCategory || null,
+      acctAssignment: item.acctAssignment || null,
+      sourceRow: num(item.sourceRow),
+      raw: item.raw ? JSON.stringify(item.raw) : null
+    }
+  );
+}
+
 // Creates one PO with its lines and its ten step rows. `runner` is a
 // transaction from withTransaction (imports create many POs in one).
 //   po: { poNo, supplierId, supplierCode, supplierName, documentDate, docType,
@@ -95,46 +138,7 @@ async function createPo(runner, { sectionId, po, items, userId, source, batchId 
   )).recordset[0];
   const poId = inserted.id;
 
-  for (const item of items) {
-    await runner.query(
-      `INSERT INTO po_items (po_id, item_no, material_id, material_code, short_text, vendor_material, material_type,
-         material_group, order_qty, order_unit, net_price, currency, qty_sku, sku_unit, lead_time_days,
-         po_history_release, doc_category, order_price_unit, price_unit, still_to_invoice_qty, still_to_invoice_val,
-         deletion_indicator, item_category, acct_assignment_cat, source_row, raw_data)
-       VALUES (@poId, @itemNo, @materialId, @materialCode, @shortText, @vendorMaterial, @materialType,
-         @materialGroup, @orderQty, @orderUnit, @netPrice, @currency, @qtySku, @skuUnit, @leadTimeDays,
-         @poHistory, @docCategory, @orderPriceUnit, @priceUnit, @stillQty, @stillVal,
-         @deletionIndicator, @itemCategory, @acctAssignment, @sourceRow, @raw)`,
-      {
-        poId,
-        itemNo: item.itemNo || null,
-        materialId: item.materialId || null,
-        materialCode: item.materialCode || null,
-        shortText: item.shortText || null,
-        vendorMaterial: item.vendorMaterial || null,
-        materialType: item.materialType || null,
-        materialGroup: item.materialGroup || null,
-        orderQty: num(item.orderQty),
-        orderUnit: item.orderUnit || null,
-        netPrice: num(item.netPrice),
-        currency: item.currency || null,
-        qtySku: num(item.qtySku),
-        skuUnit: item.skuUnit || null,
-        leadTimeDays: num(item.leadTimeDays),
-        poHistory: item.poHistory || null,
-        docCategory: item.docCategory || null,
-        orderPriceUnit: item.orderPriceUnit || null,
-        priceUnit: num(item.priceUnit),
-        stillQty: num(item.stillQty),
-        stillVal: num(item.stillVal),
-        deletionIndicator: item.deletionIndicator || null,
-        itemCategory: item.itemCategory || null,
-        acctAssignment: item.acctAssignment || null,
-        sourceRow: num(item.sourceRow),
-        raw: item.raw ? JSON.stringify(item.raw) : null
-      }
-    );
-  }
+  for (const item of items) await insertItem(runner, poId, item);
 
   for (let n = 1; n <= STEP_COUNT; n += 1) {
     await runner.query(
@@ -674,6 +678,7 @@ function safeJson(text) {
 module.exports = {
   PO_COLUMNS,
   PO_FROM,
+  addHistory,
   advancePo,
   buildFilters,
   cancelPo,
@@ -681,8 +686,10 @@ module.exports = {
   deletePo,
   getPoDetail,
   httpError,
+  insertItem,
   listPos,
   loadContext,
+  lockPo,
   recomputePo,
   recomputeSection,
   reopenPo,

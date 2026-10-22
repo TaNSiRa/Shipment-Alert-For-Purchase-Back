@@ -1,9 +1,9 @@
 const { query, withTransaction } = require("../db/pool");
-const { todayIso } = require("./dates");
+const { toIso, todayIso } = require("./dates");
 const { arrivalStepNo, computeSchedule } = require("./workflowService");
-const { createPo, resolveLeadTime } = require("./poService");
+const { addHistory, createPo, httpError, insertItem, lockPo, recomputePo, resolveLeadTime } = require("./poService");
 const {
-  buildSheet, cellValue, decodeUpload, loadWorkbook, mapHeaders, normalizeMaterialCode, toDate, toNumber, toText
+  buildSheet, cellValue, decodeUpload, loadWorkbook, mapHeaders, normHeader, normalizeMaterialCode, toDate, toNumber, toText
 } = require("./excelKit");
 
 // Column names accepted for each field, compared after lower-casing and
@@ -148,10 +148,10 @@ async function readLines(buffer) {
       remark: toText(get(row, "remark"), 500)
     });
   }
-  return { lines, sheetName: sheet.name, headerRow, headers: headers.map(h => h.name) };
+  return { lines, sheetName: sheet.name, headerRow, headers: headers.map(h => h.name), fields: Object.keys(columns) };
 }
 
-async function loadMasters(sectionId) {
+async function loadMasters(sectionId, poNos) {
   const [suppliers, materials, existing] = await Promise.all([
     query("SELECT id, supplier_code, name, short_name FROM suppliers WHERE section_id = @sectionId", { sectionId }),
     query(
@@ -159,7 +159,7 @@ async function loadMasters(sectionId) {
        FROM materials WHERE section_id = @sectionId AND is_active = 1 AND material_code IS NOT NULL`,
       { sectionId }
     ),
-    query("SELECT po_no, status FROM purchase_orders WHERE section_id = @sectionId", { sectionId })
+    query("SELECT id, po_no FROM purchase_orders WHERE section_id = @sectionId", { sectionId })
   ]);
   const supplierByCode = new Map(suppliers.recordset.map(s => [`${s.supplier_code}`.trim(), s]));
   const materialsByCode = new Map();
@@ -168,7 +168,34 @@ async function loadMasters(sectionId) {
     if (!materialsByCode.has(key)) materialsByCode.set(key, []);
     materialsByCode.get(key).push(m);
   }
-  const existingPos = new Map(existing.recordset.map(p => [p.po_no, p.status]));
+  // POs of the file that are already in the system, with their lines and the
+  // acknowledgement date — what a re-import is compared against.
+  const inFile = new Set(poNos);
+  const ids = existing.recordset.filter(p => inFile.has(p.po_no)).map(p => p.id);
+  const existingPos = new Map();
+  if (ids.length) {
+    const params = { ids: ids.join(",") };
+    const [heads, items, acks] = await Promise.all([
+      query(
+        `SELECT id, po_no, status, supplier_id, supplier_code, supplier_name, document_date, doc_type, plant,
+                ship_mode, currency, remark, lead_time_days, lead_time_source
+         FROM purchase_orders WHERE id IN (SELECT value FROM STRING_SPLIT(@ids, ','))`,
+        params
+      ),
+      query("SELECT * FROM po_items WHERE po_id IN (SELECT value FROM STRING_SPLIT(@ids, ',')) ORDER BY id", params),
+      query(
+        "SELECT po_id, actual_date FROM po_steps WHERE step_no = 2 AND po_id IN (SELECT value FROM STRING_SPLIT(@ids, ','))",
+        params
+      )
+    ]);
+    for (const p of heads.recordset) {
+      existingPos.set(p.po_no, {
+        ...p,
+        items: items.recordset.filter(i => i.po_id === p.id),
+        ackDate: toIso(acks.recordset.find(a => a.po_id === p.id)?.actual_date)
+      });
+    }
+  }
   return { supplierByCode, materialsByCode, existingPos };
 }
 
@@ -185,9 +212,8 @@ function matchMaterial(materialsByCode, code, supplierId) {
 
 // Groups lines into POs and checks each one. Nothing is written.
 async function analyze(sectionId, buffer, ctx) {
-  const { lines, sheetName, headers } = await readLines(buffer);
+  const { lines, sheetName, headers, fields } = await readLines(buffer);
   const headersCount = headers.length;
-  const masters = await loadMasters(sectionId);
   const today = todayIso();
   const groups = new Map();
   const orphanRows = [];
@@ -199,6 +225,7 @@ async function analyze(sectionId, buffer, ctx) {
     if (!groups.has(line.poNo)) groups.set(line.poNo, []);
     groups.get(line.poNo).push(line);
   }
+  const masters = await loadMasters(sectionId, [...groups.keys()]);
 
   const pos = [];
   for (const [poNo, rows] of groups) {
@@ -268,7 +295,11 @@ async function analyze(sectionId, buffer, ctx) {
       warnings.push(`${unmatched.length} material(s) not in the Material Master (${unmatched.slice(0, 3).map(i => i.materialCode || "no code").join(", ")}${unmatched.length > 3 ? "…" : ""}) — lead time falls back`);
     }
 
-    const lead = resolveLeadTime(liveItems, ctx.sched);
+    const existing = masters.existingPos.get(poNo);
+    // A lead time set by hand on a PO already in the system is kept by a re-import.
+    const lead = existing?.lead_time_source === "MANUAL"
+      ? { days: existing.lead_time_days, source: "MANUAL" }
+      : resolveLeadTime(liveItems, ctx.sched);
     let etaDate = null;
     let nextDueDate = null;
     if (documentDate) {
@@ -279,22 +310,52 @@ async function analyze(sectionId, buffer, ctx) {
       etaDate = due[arrivalStepNo(ctx.steps)];
       nextDueDate = due[2];
     }
-    const existsStatus = masters.existingPos.get(poNo);
-    if (existsStatus) errors.push(`PO ${poNo} is already in the system (${existsStatus.toLowerCase()})`);
-    const status = existsStatus ? "EXISTS" : errors.length ? "ERROR" : "NEW";
-    pos.push({
-      poNo,
-      status,
+    const header = {
       supplierCode,
       supplierName: supplier?.name || supplierName,
-      supplierShort: supplier?.short_name || null,
-      supplierStatus,
       documentDate,
       docType: live[0]?.docType || null,
       plant: live[0]?.plant || null,
       shipMode: live.map(r => r.shipMode).find(Boolean) || null,
       currency: live.map(r => r.currency).find(Boolean) || null,
-      remark: live.map(r => r.remark).find(Boolean) || null,
+      remark: live.map(r => r.remark).find(Boolean) || null
+    };
+
+    // Already in the system: unchanged -> EXISTS (nothing to do); different
+    // -> CHANGED, which the user may choose to apply.
+    let changes = null;
+    let status;
+    if (!existing) {
+      status = errors.length ? "ERROR" : "NEW";
+    } else {
+      changes = diffExisting(existing, header, items, headers);
+      const state = existing.status.toLowerCase();
+      if (!changes.count) {
+        errors.push(`PO ${poNo} is already in the system (${state}) — nothing in the file is different`);
+        status = "EXISTS";
+      } else if (existing.status === "CANCELLED") {
+        errors.push(`PO ${poNo} is cancelled — the changes in the file are not applied (reopen it first)`);
+        status = "EXISTS";
+      } else {
+        const dateChange = changes.po.find(c => c.field === "documentDate");
+        if (dateChange && existing.ackDate && dateChange.to > existing.ackDate) {
+          errors.push(`PO date ${dateChange.to} is after the acknowledgement date (${existing.ackDate})`);
+        }
+        for (const l of changes.lines.filter(x => x.kind === "MISSING")) {
+          warnings.push(`Line ${l.itemNo ?? "-"} (${l.materialCode || "no code"}) is in the system but not in the file — it is kept`);
+        }
+        status = errors.length ? "ERROR" : "CHANGED";
+      }
+    }
+    pos.push({
+      poNo,
+      status,
+      existingId: existing?.id || null,
+      existingStatus: existing?.status || null,
+      changes,
+      ...header,
+      supplierShort: supplier?.short_name || null,
+      supplierStatus,
       leadTimeDays: lead.days,
       leadTimeSource: lead.source,
       nextDueDate,
@@ -315,6 +376,7 @@ async function analyze(sectionId, buffer, ctx) {
     pos: pos.length,
     ready: pos.filter(p => p.status === "NEW").length,
     existing: pos.filter(p => p.status === "EXISTS").length,
+    changed: pos.filter(p => p.status === "CHANGED").length,
     errors: pos.filter(p => p.status === "ERROR").length,
     withWarnings: pos.filter(p => p.status === "NEW" && p.warnings.length).length,
     newSuppliers: [...new Set(pos.filter(p => p.supplierStatus === "NEW").map(p => p.supplierCode))].length,
@@ -322,24 +384,262 @@ async function analyze(sectionId, buffer, ctx) {
     columns: headersCount,
     orphanRows
   };
-  return { summary, pos };
+  return { summary, pos, fields, headers };
 }
 
 async function preview(sectionId, base64, ctx) {
   const buffer = decodeUpload(base64);
-  return analyze(sectionId, buffer, ctx);
+  const { summary, pos } = await analyze(sectionId, buffer, ctx);
+  // The line pairing is only needed by commit.
+  for (const p of pos) if (p.changes) delete p.changes.pairs;
+  return { summary, pos };
+}
+
+// ---------------------------------------------------------------------------
+// Re-import: comparing a PO in the file with the same PO already stored
+// ---------------------------------------------------------------------------
+
+// PO-level values a re-import may change. A blank in the file never clears
+// what the system has (Mode and Remark are often set in the app, not in SAP).
+const PO_FIELDS = [
+  ["documentDate", "PO date", "document_date"],
+  ["supplierCode", "Supplier", "supplier_code"],
+  ["docType", "Doc type", "doc_type"],
+  ["plant", "Plant", "plant"],
+  ["shipMode", "Mode", "ship_mode"],
+  ["currency", "Currency", "currency"],
+  ["remark", "Remark", "remark"]
+];
+
+// Cell values as stored and as read can differ in form only: 8 vs "8",
+// 22260 vs 22260.00 from a DECIMAL column, "0013000543" vs "13000543".
+function sameValue(a, b) {
+  if (`${a ?? ""}` === `${b ?? ""}`) return true;
+  const na = toNumber(a);
+  const nb = toNumber(b);
+  return na !== null && nb !== null && Math.abs(na - nb) < 0.005;
+}
+
+// SAP writes "00010" in some exports and "10" in others.
+function itemKey(itemNo) {
+  const text = `${itemNo ?? ""}`.trim();
+  return text ? text.replace(/^0+(?=\d)/, "") : "";
+}
+
+// One stored line against the same line in the file, by the file's column
+// headers. A line imported from Excel is compared cell by cell (raw_data); one
+// typed by hand has only the typed columns. A column the file does not have is
+// not a change.
+function lineChanges(stored, item, headers) {
+  const raw = stored.raw_data ? parseRaw(stored.raw_data) : null;
+  const out = [];
+  for (const header of headers) {
+    const field = fieldOfHeader(header);
+    if (PO_LEVEL.has(field)) continue;
+    let from;
+    if (raw) {
+      from = raw[header] ?? null;
+    } else {
+      const spec = field && ITEM_COLUMNS[field];
+      if (!spec) continue;
+      from = stored[spec[0]] ?? null;
+    }
+    const to = item.raw[header] ?? null;
+    if (!sameValue(from, to)) out.push({ header, from, to });
+  }
+  return out;
+}
+
+// { po: [{ field, label, from, to }], lines: [{ kind, itemNo, ... }], pairs, count }
+//   kind: ADDED (new in the file), CHANGED, MISSING (stored, not in the file —
+//   kept: an export filtered to open items must not delete lines).
+function diffExisting(existing, header, items, headers) {
+  const po = [];
+  for (const [field, label, column] of PO_FIELDS) {
+    const to = header[field];
+    if (to === null || to === undefined) continue;
+    const from = field === "documentDate" ? toIso(existing[column]) : existing[column] ?? null;
+    if (`${from ?? ""}` !== `${to}`) po.push({ field, label, from, to });
+  }
+  const byKey = new Map();
+  for (const s of existing.items) {
+    const key = itemKey(s.item_no);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(s);
+  }
+  const lines = [];
+  const pairs = [];
+  items.forEach((item, index) => {
+    const stored = byKey.get(itemKey(item.itemNo))?.shift();
+    if (!stored) {
+      lines.push({ kind: "ADDED", itemNo: item.itemNo, materialCode: item.materialCode, itemIndex: index, columns: [] });
+      return;
+    }
+    pairs.push({ itemId: stored.id, itemIndex: index });
+    const columns = lineChanges(stored, item, headers);
+    if (columns.length) {
+      lines.push({ kind: "CHANGED", itemNo: item.itemNo, materialCode: item.materialCode, itemId: stored.id, itemIndex: index, columns });
+    }
+  });
+  for (const rest of byKey.values()) {
+    for (const s of rest) lines.push({ kind: "MISSING", itemNo: s.item_no, materialCode: s.material_code, itemId: s.id, columns: [] });
+  }
+  const count = po.length + lines.filter(l => l.kind !== "MISSING").length;
+  return { po, lines, pairs, count };
+}
+
+// Typed po_items columns a changed line gets from the file — only the fields
+// the file has a column for, so a sheet without "Net Price" keeps the price.
+function itemUpdate(item, fields) {
+  const has = new Set(fields);
+  const sets = [];
+  const params = {};
+  const put = (column, key, value) => {
+    sets.push(`${column} = @${key}`);
+    params[key] = value ?? null;
+  };
+  const textFields = {
+    itemNo: "item_no", shortText: "short_text", vendorMaterial: "vendor_material", orderUnit: "order_unit",
+    currency: "currency", skuUnit: "sku_unit", materialGroup: "material_group", poHistory: "po_history_release",
+    docCategory: "doc_category", orderPriceUnit: "order_price_unit", itemCategory: "item_category",
+    acctAssignment: "acct_assignment_cat"
+  };
+  const numberFields = {
+    orderQty: "order_qty", netPrice: "net_price", qtySku: "qty_sku", priceUnit: "price_unit",
+    stillQty: "still_to_invoice_qty", stillVal: "still_to_invoice_val"
+  };
+  for (const [field, column] of Object.entries(textFields)) if (has.has(field)) put(column, field, item[field]);
+  for (const [field, column] of Object.entries(numberFields)) if (has.has(field)) put(column, field, toNumber(item[field]));
+  if (has.has("deletion")) put("deletion_indicator", "deletionIndicator", item.deletionIndicator);
+  // A material code brings its master row again: id, type, lead time and
+  // (when the file has no Vendor Material column) the vendor's own code.
+  if (has.has("materialCode")) {
+    put("material_code", "materialCode", item.materialCode);
+    put("material_id", "materialId", item.materialId);
+    put("material_type", "materialType", item.materialType);
+    put("lead_time_days", "leadTimeDays", item.leadTimeDays);
+    if (!has.has("vendorMaterial")) put("vendor_material", "vendorMaterial", item.vendorMaterial);
+    if (!has.has("shortText") && item.shortText) put("short_text", "shortText", item.shortText);
+  }
+  return { sets, params };
+}
+
+// The stored SAP row takes the file's cells; a cell blank in the file is
+// cleared, a column the file does not have is kept.
+function mergeRaw(storedText, fileRaw, headers) {
+  const merged = { ...parseRaw(storedText) };
+  for (const h of headers) {
+    if (fileRaw[h] === null || fileRaw[h] === undefined) delete merged[h];
+    else merged[h] = fileRaw[h];
+  }
+  return merged;
+}
+
+// Applies one CHANGED PO inside the commit transaction.
+async function applyChanges(tx, p, { sectionId, supplier, userId, batchId, fileName, headers, fields }, ctx) {
+  const po = await lockPo(tx, p.existingId, sectionId);
+  if (po.status === "CANCELLED") throw httpError(409, `PO ${p.poNo} was cancelled meanwhile — preview the file again`);
+
+  const poSets = [];
+  const poParams = { poId: po.id, userId };
+  let replan = false;
+  const historyChanges = {};
+  for (const c of p.changes.po) {
+    historyChanges[c.label] = { from: c.from, to: c.to };
+    if (c.field === "documentDate") {
+      poSets.push("document_date = @documentDate");
+      poParams.documentDate = c.to;
+      replan = true;
+    } else if (c.field === "supplierCode") {
+      poSets.push("supplier_id = @supplierId", "supplier_code = @supplierCode", "supplier_name = @supplierName");
+      Object.assign(poParams, { supplierId: supplier?.id || null, supplierCode: c.to, supplierName: p.supplierName || c.to });
+    } else {
+      const column = PO_FIELDS.find(f => f[0] === c.field)[2];
+      poSets.push(`${column} = @${c.field}`);
+      poParams[c.field] = c.to;
+    }
+  }
+  if (poParams.documentDate) {
+    await tx.query("UPDATE po_steps SET actual_date = @documentDate WHERE po_id = @poId AND step_no = 1", poParams);
+  }
+
+  // Every paired line takes the file's SAP row (PO-level cells such as the
+  // Document Date live in it too); changed lines also their typed columns.
+  const stored = new Map((await tx.query("SELECT id, raw_data FROM po_items WHERE po_id = @poId", { poId: po.id }))
+    .recordset.map(r => [r.id, r.raw_data]));
+  const changedIds = new Set(p.changes.lines.filter(l => l.kind === "CHANGED").map(l => l.itemId));
+  for (const pair of p.changes.pairs) {
+    if (!stored.has(pair.itemId)) continue;
+    const item = p.items[pair.itemIndex];
+    const { sets, params } = changedIds.has(pair.itemId) ? itemUpdate(item, fields) : { sets: [], params: {} };
+    await tx.query(
+      `UPDATE po_items SET ${[...sets, "raw_data = @raw", "source_row = @sourceRow"].join(", ")} WHERE id = @itemId`,
+      { ...params, itemId: pair.itemId, raw: JSON.stringify(mergeRaw(stored.get(pair.itemId), item.raw, headers)), sourceRow: item.sourceRow }
+    );
+  }
+  let added = 0;
+  for (const l of p.changes.lines.filter(x => x.kind === "ADDED")) {
+    await insertItem(tx, po.id, p.items[l.itemIndex]);
+    added += 1;
+  }
+
+  // Value and (unless set by hand) lead time follow the lines.
+  const live = (await tx.query(
+    "SELECT order_qty, net_price, lead_time_days FROM po_items WHERE po_id = @poId AND deletion_indicator IS NULL",
+    { poId: po.id }
+  )).recordset;
+  poParams.totalValue = live.reduce((sum, i) => {
+    const qty = Number(i.order_qty);
+    const price = Number(i.net_price);
+    return i.order_qty !== null && i.net_price !== null && Number.isFinite(qty * price) ? sum + qty * price : sum;
+  }, 0) || null;
+  poSets.push("total_value = @totalValue");
+  if (po.lead_time_source !== "MANUAL") {
+    const lead = resolveLeadTime(live.map(i => ({ leadTimeDays: i.lead_time_days })), ctx.sched);
+    if (lead.days !== po.lead_time_days || lead.source !== po.lead_time_source) {
+      poSets.push("lead_time_days = @leadDays", "lead_time_source = @leadSource");
+      Object.assign(poParams, { leadDays: lead.days, leadSource: lead.source });
+      if (lead.days !== po.lead_time_days) {
+        historyChanges["Lead time"] = { from: po.lead_time_days, to: lead.days };
+        replan = true;
+      }
+    }
+  }
+  await tx.query(
+    `UPDATE purchase_orders SET ${poSets.join(", ")}, updated_by = @userId,
+       updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @poId`,
+    poParams
+  );
+  if (replan) await recomputePo(tx, po.id, ctx, { rebaseline: true });
+  await addHistory(tx, po.id, "IMPORT_UPDATED", {
+    actorId: userId,
+    detail: {
+      fileName,
+      batchId,
+      changes: historyChanges,
+      lines: p.changes.lines.filter(l => l.kind !== "MISSING").map(l => ({
+        kind: l.kind,
+        itemNo: l.itemNo,
+        materialCode: l.materialCode,
+        changes: Object.fromEntries(l.columns.map(c => [c.header, { from: c.from, to: c.to }]))
+      }))
+    }
+  });
+  return { id: po.id, added };
 }
 
 // Re-reads the same file (the client sends it again — nothing is cached
-// between preview and commit) and creates the chosen POs in one transaction:
-// all of them or none.
+// between preview and commit) and, in one transaction (all of them or none),
+// creates the chosen new POs and applies the file to the chosen CHANGED ones.
+// A CHANGED PO is only touched when it is named in poNos.
 async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
   const buffer = decodeUpload(data);
-  const { summary, pos } = await analyze(sectionId, buffer, ctx);
+  const { summary, pos, fields, headers } = await analyze(sectionId, buffer, ctx);
   const wanted = new Set((poNos || []).map(p => `${p}`));
   const chosen = pos.filter(p => p.status === "NEW" && (!wanted.size || wanted.has(p.poNo)));
-  if (!chosen.length) {
-    const err = new Error("Nothing to import — every selected PO already exists or has errors");
+  const toUpdate = pos.filter(p => p.status === "CHANGED" && wanted.has(p.poNo));
+  if (!chosen.length && !toUpdate.length) {
+    const err = new Error("Nothing to import — every selected PO is already in the system unchanged, or has errors");
     err.status = 400;
     throw err;
   }
@@ -352,7 +652,8 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
     )).recordset;
     for (const s of existing) supplierIds.set(`${s.supplier_code}`, s);
     let suppliersAdded = 0;
-    for (const p of chosen) {
+    const supplierMoves = toUpdate.filter(p => p.changes.po.some(c => c.field === "supplierCode"));
+    for (const p of [...chosen, ...supplierMoves]) {
       if (!p.supplierCode || supplierIds.has(p.supplierCode)) continue;
       const row = (await tx.query(
         `INSERT INTO suppliers (section_id, supplier_code, name, remark)
@@ -363,18 +664,22 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
       supplierIds.set(p.supplierCode, row);
       suppliersAdded += 1;
     }
+    const batchName = `${fileName || "upload.xlsx"}`.slice(0, 255);
     const batch = (await tx.query(
-      `INSERT INTO import_batches (section_id, file_name, uploaded_by, total_rows, po_created, po_skipped, items_created, file_data, sheet_name)
+      `INSERT INTO import_batches (section_id, file_name, uploaded_by, total_rows, po_created, po_updated, po_skipped,
+         items_created, file_data, sheet_name)
        OUTPUT INSERTED.id
-       VALUES (@sectionId, @fileName, @userId, @totalRows, @created, @skipped, @items, @fileData, @sheetName)`,
+       VALUES (@sectionId, @fileName, @userId, @totalRows, @created, @updated, @skipped, @items, @fileData, @sheetName)`,
       {
         sectionId,
-        fileName: `${fileName || "upload.xlsx"}`.slice(0, 255),
+        fileName: batchName,
         userId: user.id,
         totalRows: summary.lines,
         created: chosen.length,
-        skipped: pos.length - chosen.length,
-        items: chosen.reduce((s, p) => s + p.items.length, 0),
+        updated: toUpdate.length,
+        skipped: pos.length - chosen.length - toUpdate.length,
+        items: chosen.reduce((s, p) => s + p.items.length, 0)
+          + toUpdate.reduce((s, p) => s + p.changes.lines.filter(l => l.kind === "ADDED").length, 0),
         fileData: buffer,
         sheetName: summary.sheetName
       }
@@ -404,9 +709,171 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
       }, ctx);
       created.push({ id, poNo: p.poNo });
     }
-    return { batchId: batch.id, created, suppliersAdded };
+    const updated = [];
+    for (const p of toUpdate) {
+      const supplier = p.supplierCode ? supplierIds.get(p.supplierCode) : null;
+      const { id } = await applyChanges(tx, p, {
+        sectionId, supplier, userId: user.id, batchId: batch.id, fileName: batchName, headers, fields
+      }, ctx);
+      updated.push({ id, poNo: p.poNo });
+    }
+    return { batchId: batch.id, created, updated, suppliersAdded };
   });
-  return { ...result, skipped: pos.length - chosen.length };
+  return { ...result, skipped: pos.length - chosen.length - toUpdate.length };
+}
+
+// ---------------------------------------------------------------------------
+// Editing one stored SAP line (the "all columns" view of a PO item)
+// ---------------------------------------------------------------------------
+
+// Columns that describe the whole PO, not the line. They stay read-only here —
+// the PO's own Edit (or a re-import, see applyChanges) changes them, so the PO
+// and its lines cannot disagree.
+const PO_LEVEL = new Set(["poNo", "supplier", "supplierCode", "documentDate", "docType", "plant", "shipMode", "remark"]);
+
+// Line fields -> po_items column and how the cell text is stored.
+const ITEM_COLUMNS = {
+  itemNo: ["item_no", "text", 10],
+  materialCode: ["material_code", "material"],
+  shortText: ["short_text", "text", 255],
+  vendorMaterial: ["vendor_material", "text", 255],
+  orderQty: ["order_qty", "number"],
+  orderUnit: ["order_unit", "text", 20],
+  netPrice: ["net_price", "number"],
+  currency: ["currency", "text", 10],
+  qtySku: ["qty_sku", "number"],
+  skuUnit: ["sku_unit", "text", 20],
+  materialGroup: ["material_group", "text", 40],
+  deletion: ["deletion_indicator", "text", 5],
+  poHistory: ["po_history_release", "text", 100],
+  docCategory: ["doc_category", "text", 10],
+  orderPriceUnit: ["order_price_unit", "text", 20],
+  priceUnit: ["price_unit", "number"],
+  stillQty: ["still_to_invoice_qty", "number"],
+  stillVal: ["still_to_invoice_val", "number"],
+  itemCategory: ["item_category", "text", 10],
+  acctAssignment: ["acct_assignment_cat", "text", 10]
+};
+
+function fieldOfHeader(header) {
+  const key = normHeader(header);
+  return Object.keys(ALIASES).find(f => ALIASES[f].includes(key)) || null;
+}
+
+// The headers of a stored line that cannot be edited on the line itself.
+function lockedHeaders(raw) {
+  return Object.keys(raw || {}).filter(h => PO_LEVEL.has(fieldOfHeader(h)));
+}
+
+function parseRaw(text) {
+  try {
+    return text ? JSON.parse(text) || {} : {};
+  } catch {
+    return {};
+  }
+}
+
+// values: { header: text } for the columns being changed. Only headers the
+// line already has are accepted. The matching po_items columns follow, then
+// the PO's value and (unless set by hand) its lead time are worked out again.
+async function updateItem(poId, itemId, sectionId, values, user, ctx) {
+  return withTransaction(async tx => {
+    const po = await lockPo(tx, poId, sectionId);
+    if (po.status === "CANCELLED") throw httpError(400, `PO ${po.po_no} is cancelled`);
+    const item = (await tx.query(
+      "SELECT * FROM po_items WHERE id = @itemId AND po_id = @poId", { itemId, poId }
+    )).recordset[0];
+    if (!item) throw httpError(404, "PO line not found");
+
+    const raw = parseRaw(item.raw_data);
+    const locked = new Set(lockedHeaders(raw));
+    const changes = {};
+    for (const [header, input] of Object.entries(values || {})) {
+      if (!Object.prototype.hasOwnProperty.call(raw, header)) continue;
+      if (locked.has(header)) throw httpError(400, `"${header}" belongs to the whole PO — change it with Edit PO`);
+      const before = raw[header];
+      const text = `${input ?? ""}`.trim().slice(0, 255);
+      const after = !text ? null : typeof before === "number" && toNumber(text) !== null ? toNumber(text) : text;
+      if (`${before ?? ""}` === `${after ?? ""}`) continue;
+      const field = fieldOfHeader(header);
+      if (field && ITEM_COLUMNS[field]?.[1] === "number" && after !== null && toNumber(after) === null) {
+        throw httpError(400, `"${header}" must be a number`);
+      }
+      changes[header] = { from: before ?? null, to: after };
+      raw[header] = after;
+    }
+    if (!Object.keys(changes).length) return { id: poId, itemId, changed: false };
+
+    const sets = ["raw_data = @raw"];
+    const params = { itemId, raw: JSON.stringify(raw) };
+    const columnValues = {};
+    for (const header of Object.keys(changes)) {
+      const field = fieldOfHeader(header);
+      const spec = field && ITEM_COLUMNS[field];
+      if (!spec || columnValues[field] !== undefined) continue;
+      const [column, kind, max] = spec;
+      const value = kind === "number" ? toNumber(raw[header])
+        : kind === "material" ? normalizeMaterialCode(raw[header])
+        : toText(raw[header], max);
+      columnValues[field] = value;
+      sets.push(`${column} = @${field}`);
+      params[field] = value;
+    }
+
+    // A new material code is looked up in the master again (this supplier's
+    // row first), which also brings its lead time.
+    if (columnValues.materialCode !== undefined) {
+      const code = columnValues.materialCode;
+      const rows = code ? (await tx.query(
+        `SELECT id, supplier_id, material_type, vendor_material, lead_time_days FROM materials
+         WHERE section_id = @sectionId AND is_active = 1 AND UPPER(material_code) = @code`,
+        { sectionId, code: code.toUpperCase() }
+      )).recordset : [];
+      const byCode = new Map(rows.length ? [[code.toUpperCase(), rows]] : []);
+      const { match } = matchMaterial(byCode, code, po.supplier_id);
+      sets.push("material_id = @materialId", "material_type = @materialType", "lead_time_days = @itemLead");
+      Object.assign(params, {
+        materialId: match?.id || null, materialType: match?.material_type || null, itemLead: match?.lead_time_days || null
+      });
+      if (columnValues.vendorMaterial === undefined) {
+        sets.push("vendor_material = @vendorMaterial");
+        params.vendorMaterial = match?.vendor_material || null;
+      }
+    }
+    await tx.query(`UPDATE po_items SET ${sets.join(", ")} WHERE id = @itemId`, params);
+
+    const live = (await tx.query(
+      "SELECT order_qty, net_price, lead_time_days FROM po_items WHERE po_id = @poId AND deletion_indicator IS NULL",
+      { poId }
+    )).recordset;
+    const totalValue = live.reduce((sum, i) => {
+      const qty = Number(i.order_qty);
+      const price = Number(i.net_price);
+      return i.order_qty !== null && i.net_price !== null && Number.isFinite(qty * price) ? sum + qty * price : sum;
+    }, 0) || null;
+    let replan = false;
+    const poSets = ["total_value = @totalValue"];
+    const poParams = { poId, totalValue, userId: user.id };
+    if (po.lead_time_source !== "MANUAL") {
+      const lead = resolveLeadTime(live.map(i => ({ leadTimeDays: i.lead_time_days })), ctx.sched);
+      if (lead.days !== po.lead_time_days || lead.source !== po.lead_time_source) {
+        poSets.push("lead_time_days = @leadDays", "lead_time_source = @leadSource");
+        Object.assign(poParams, { leadDays: lead.days, leadSource: lead.source });
+        replan = lead.days !== po.lead_time_days;
+      }
+    }
+    await tx.query(
+      `UPDATE purchase_orders SET ${poSets.join(", ")}, updated_by = @userId,
+         updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @poId`,
+      poParams
+    );
+    if (replan) await recomputePo(tx, poId, ctx, { rebaseline: true });
+    await addHistory(tx, poId, "ITEM_EDITED", {
+      actorId: user.id,
+      detail: { itemNo: item.item_no, materialCode: item.material_code, changes }
+    });
+    return { id: poId, poNo: po.po_no, itemId, changed: true, replanned: replan };
+  });
 }
 
 // The blank sheet offered to people who are not exporting from SAP.
@@ -437,4 +904,6 @@ async function templateBuffer() {
   });
 }
 
-module.exports = { ALIASES, analyze, commit, detectShipMode, preview, readLines, splitSupplier, templateBuffer };
+module.exports = {
+  ALIASES, analyze, commit, detectShipMode, lockedHeaders, preview, readLines, splitSupplier, templateBuffer, updateItem
+};
