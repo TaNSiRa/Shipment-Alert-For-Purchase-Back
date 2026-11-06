@@ -6,7 +6,7 @@ const { registerRealtime } = require("./services/realtimeService");
 const { startMailScheduler } = require("./services/mailScheduler");
 const { query } = require("./db/pool");
 const { runMigrations } = require("./db/migrations");
-const { applySchema } = require("./db/initDb");
+const { applySchema, logSchemaFailures } = require("./db/initDb");
 
 const app = createApp();
 const server = http.createServer(app);
@@ -20,7 +20,10 @@ registerRealtime(io);
 // data in line with the code (both idempotent), so pulling the code and
 // restarting is enough. A database that is not reachable yet is not a reason
 // to stay down: /health reports it.
+// A batch the server refuses is logged as "[schema] …" and the rest still run;
+// `npm run db:check` on the server lists what is still missing.
 applySchema(text => query(text))
+  .then(({ failures }) => logSchemaFailures(failures))
   .then(() => runMigrations({ query }))
   .catch(err => console.error(`[migrations] ${err.message}`));
 

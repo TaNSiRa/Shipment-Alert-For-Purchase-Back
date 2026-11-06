@@ -8,6 +8,7 @@
     "dev": "nodemon -L --watch src src/Purchase-Alert.js",
     "start": "node src/Purchase-Alert.js",
     "db:init": "node scripts/init-db.js",
+    "db:check": "node scripts/check-schema.js",
     "db:seed-master": "node scripts/import-master-xlsx.js",
     "db:seed-demo": "node scripts/seed-demo.js",
     "test": "node --test --test-concurrency=1 test/"
