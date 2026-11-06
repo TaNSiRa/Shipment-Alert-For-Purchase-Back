@@ -6,10 +6,12 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { writeAudit } = require("../../middleware/audit");
 const { requireEditor, requireSectionAdmin, resolveSection } = require("../../services/sectionService");
 const {
-  PO_COLUMNS, PO_FROM, advancePo, cancelPo, createPo, deletePo, getPoDetail, listPos, loadContext,
+  PO_COLUMNS, PO_FROM, advancePo, cancelPo, createPo, deletePo, getPoDetail, getShipment, listPos, loadContext,
   reopenPo, serializePo, undoLastStep, updatePo
 } = require("../../services/poService");
 const poImport = require("../../services/poImport");
+const ocrImport = require("../../services/ocrImport");
+const { decodeUpload } = require("../../services/excelKit");
 const { poListBuffer } = require("../../services/reportService");
 const { emitSection } = require("../../services/realtimeService");
 const { endOfMonth, isIsoDate, todayIso } = require("../../services/dates");
@@ -60,7 +62,7 @@ router.get("/import/batches", asyncHandler(async (req, res) => {
   const params = { sectionId: req.section.id, offset: (page - 1) * pageSize, pageSize };
   const total = (await query("SELECT COUNT(1) AS n FROM import_batches WHERE section_id = @sectionId", params)).recordset[0].n;
   const rows = (await query(
-    `SELECT b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_updated, b.po_skipped, b.items_created,
+    `SELECT b.id, b.file_name, b.sheet_name, b.total_rows, b.po_created, b.po_updated, b.po_skipped, b.items_created, b.kind,
             b.created_at, u.display_name, CAST(CASE WHEN b.file_data IS NULL THEN 0 ELSE 1 END AS BIT) AS has_file,
             DATALENGTH(b.file_data) AS file_size
      FROM import_batches b LEFT JOIN users u ON u.id = b.uploaded_by
@@ -68,7 +70,7 @@ router.get("/import/batches", asyncHandler(async (req, res) => {
     params
   )).recordset;
   res.json({ total, page, pageSize, data: rows.map(r => ({
-    id: r.id, fileName: r.file_name, sheetName: r.sheet_name, totalRows: r.total_rows, created: r.po_created,
+    id: r.id, kind: r.kind || "PO", fileName: r.file_name, sheetName: r.sheet_name, totalRows: r.total_rows, created: r.po_created,
     updated: r.po_updated || 0, skipped: r.po_skipped, items: r.items_created, uploadedBy: r.display_name,
     createdAt: r.created_at ? new Date(r.created_at).toISOString().slice(0, 19) : null,
     hasFile: r.has_file === true || r.has_file === 1, fileSize: r.file_size
@@ -194,6 +196,13 @@ router.get("/:id(\\d+)", asyncHandler(async (req, res) => {
   res.json({ data: po });
 }));
 
+// The PO's shipment (same Acknowledgment No.): which POs "Mark done" also
+// moves, or which ones still hold it back.
+router.get("/:id(\\d+)/shipment", asyncHandler(async (req, res) => {
+  const ctx = await loadContext(req.section.id);
+  res.json({ data: await getShipment(Number(req.params.id), req.section.id, ctx) });
+}));
+
 // ---- Writes ----------------------------------------------------------------
 
 const itemSchema = z.object({
@@ -211,6 +220,7 @@ const createSchema = z.object({
   poNo: z.string().trim().min(1).max(30).regex(/^[A-Za-z0-9._/-]+$/, "PO No. may only contain letters, digits and . _ / -"),
   supplierId: z.number().int().positive(),
   documentDate: isoDate,
+  deliveryDate: isoDate,
   shipMode: z.enum(["SEA", "AIR", "TRUCK", "COURIER"]).optional().nullable(),
   remark: z.string().trim().max(1000).optional().nullable(),
   leadTimeDays: z.number().int().min(1).max(365).optional().nullable(),
@@ -221,6 +231,7 @@ const createSchema = z.object({
 router.post("/", requireEditor, asyncHandler(async (req, res) => {
   const input = createSchema.parse(req.body);
   if (input.documentDate > todayIso()) return res.status(400).json({ message: "PO date cannot be in the future" });
+  if (input.deliveryDate < input.documentDate) return res.status(400).json({ message: "Delivery date cannot be before the PO date" });
   const ctx = await loadContext(req.section.id);
   const supplier = (await query(
     "SELECT * FROM suppliers WHERE id = @id AND section_id = @sectionId",
@@ -277,6 +288,7 @@ router.post("/", requireEditor, asyncHandler(async (req, res) => {
       supplierCode: supplier.supplier_code,
       supplierName: supplier.name,
       documentDate: input.documentDate,
+      deliveryDate: input.deliveryDate,
       shipMode: input.shipMode || null,
       remark: input.remark || null,
       leadTimeDays: input.leadTimeDays || null,
@@ -290,18 +302,51 @@ router.post("/", requireEditor, asyncHandler(async (req, res) => {
   res.status(201).json({ id });
 }));
 
+// One upload box for the three files of the process. The file says what it
+// is: an OCR file (Category = Acknowledgement / Shipping Instructions) closes
+// step 2 or 3; anything else is read as the DATA EXPORT BY SAP (new POs).
 router.post("/import/preview", requireEditor, asyncHandler(async (req, res) => {
+  const input = z.object({
+    data: z.string().min(1),
+    fileName: z.string().max(255).optional().nullable(),
+    deliveryDate: isoDate.optional().nullable(),
+    actualDate: isoDate.optional().nullable()
+  }).parse(req.body || {});
   const ctx = await loadContext(req.section.id);
-  res.json(await poImport.preview(req.section.id, req.body?.data, ctx));
+  const ocr = await ocrImport.readOcr(decodeUpload(input.data));
+  if (ocr) return res.json(await ocrImport.preview(req.section.id, ocr, ctx, { actualDate: input.actualDate }));
+  res.json({ kind: "PO", ...(await poImport.preview(req.section.id, input.data, ctx, { deliveryDate: input.deliveryDate })) });
 }));
 
 router.post("/import/commit", requireEditor, asyncHandler(async (req, res) => {
   const input = z.object({
+    kind: z.enum(["PO", "ACK", "SI"]).default("PO"),
     fileName: z.string().max(255).optional().nullable(),
     data: z.string().min(1),
-    poNos: z.array(z.string().max(30)).max(5000).optional()
+    poNos: z.array(z.string().max(30)).max(5000).optional(),
+    keys: z.array(z.string().max(200)).max(5000).optional(),
+    deliveryDate: isoDate.optional().nullable(),
+    deliveryDates: z.record(z.string().max(30), isoDate).optional(),
+    actualDate: isoDate.optional().nullable(),
+    modes: z.record(z.string().max(30), z.enum(["SEA", "AIR", "TRUCK", "COURIER", ""]).nullable()).optional()
   }).parse(req.body);
   const ctx = await loadContext(req.section.id);
+  if (input.kind !== "PO") {
+    const buffer = decodeUpload(input.data);
+    const ocr = await ocrImport.readOcr(buffer);
+    if (!ocr || ocr.kind !== input.kind) {
+      return res.status(400).json({ message: `This is not an ${input.kind === "ACK" ? "OCR ACK" : "OCR SI"} file — choose the file again` });
+    }
+    const result = await ocrImport.commit(req.section.id, ocr, {
+      fileName: input.fileName, buffer, keys: input.keys, actualDate: input.actualDate
+    }, req.user, ctx);
+    await audit(req, `IMPORT_${input.kind}`, result.batchId, {
+      fileName: input.fileName, moved: result.moved.length, created: result.created.length,
+      linked: result.linked.length, skipped: result.skipped
+    });
+    changed(req, [...result.moved, ...result.created, ...result.linked].map(c => c.id));
+    return res.json(result);
+  }
   const result = await poImport.commit(req.section.id, input, req.user, ctx);
   await audit(req, "IMPORT", result.batchId, {
     fileName: input.fileName, created: result.created.length, updated: result.updated.length,
@@ -322,14 +367,17 @@ router.post("/:id(\\d+)/advance", requireEditor, asyncHandler(async (req, res) =
   const input = advanceSchema.parse(req.body);
   const ctx = await loadContext(req.section.id);
   const result = await advancePo(Number(req.params.id), req.section.id, input, req.user, ctx);
-  await audit(req, "STEP_DONE", req.params.id, { ...input, stepNo: result.stepNo });
-  changed(req, [result.id]);
+  await audit(req, "STEP_DONE", req.params.id, {
+    ...input, stepNo: result.stepNo, ...(result.withShipment.length ? { shipment: result.shipment, alsoMoved: result.withShipment.map(m => m.id) } : {})
+  });
+  changed(req, [result.id, ...result.withShipment.map(m => m.id)]);
   res.json(result);
 }));
 
 // Several POs at the same step closed together (e.g. one shipping instruction
 // covering five POs). Each PO is its own transaction: one stale or finished PO
-// is reported, it does not roll back the others.
+// is reported, it does not roll back the others. A ticked PO that already
+// moved with an earlier one's shipment is reported as done with it.
 router.post("/bulk-advance", requireEditor, asyncHandler(async (req, res) => {
   const input = advanceSchema.extend({
     ids: z.array(z.number().int().positive()).min(1).max(200),
@@ -337,15 +385,26 @@ router.post("/bulk-advance", requireEditor, asyncHandler(async (req, res) => {
   }).parse(req.body);
   const ctx = await loadContext(req.section.id);
   const results = [];
+  const movedWith = new Map();
+  const alsoMoved = [];
   for (const id of input.ids) {
+    if (movedWith.has(id)) {
+      results.push({ id, ok: true, withShipmentOf: movedWith.get(id) });
+      continue;
+    }
     try {
-      results.push({ id, ok: true, ...(await advancePo(id, req.section.id, input, req.user, ctx)) });
+      const result = await advancePo(id, req.section.id, input, req.user, ctx);
+      for (const m of result.withShipment) {
+        movedWith.set(m.id, id);
+        alsoMoved.push(m.id);
+      }
+      results.push({ id, ok: true, ...result });
     } catch (err) {
       if (!err.status || err.status >= 500) throw err;
       results.push({ id, ok: false, message: err.message });
     }
   }
-  const okIds = results.filter(r => r.ok).map(r => r.id);
+  const okIds = [...new Set([...results.filter(r => r.ok).map(r => r.id), ...alsoMoved])];
   await audit(req, "BULK_STEP_DONE", okIds.join(",").slice(0, 120), { ...input, done: okIds.length });
   changed(req, okIds);
   res.json({ done: okIds.length, failed: results.filter(r => !r.ok).length, results });
@@ -354,8 +413,11 @@ router.post("/bulk-advance", requireEditor, asyncHandler(async (req, res) => {
 router.post("/:id(\\d+)/undo", requireEditor, asyncHandler(async (req, res) => {
   const ctx = await loadContext(req.section.id);
   const result = await undoLastStep(Number(req.params.id), req.section.id, req.user, req.sectionAccess, ctx);
-  await audit(req, "STEP_UNDONE", req.params.id, result);
-  changed(req, [result.id]);
+  await audit(req, "STEP_UNDONE", req.params.id, {
+    id: result.id, poNo: result.poNo, stepNo: result.stepNo,
+    ...(result.withShipment.length ? { shipment: result.shipment, alsoUndone: result.withShipment.map(m => m.id) } : {})
+  });
+  changed(req, [result.id, ...result.withShipment.map(m => m.id)]);
   res.json(result);
 }));
 
@@ -385,7 +447,10 @@ router.patch("/:id(\\d+)", requireEditor, asyncHandler(async (req, res) => {
     remark: z.string().max(1000).optional().nullable(),
     shipMode: z.enum(["SEA", "AIR", "TRUCK", "COURIER", ""]).optional().nullable(),
     shipmentRef: z.string().max(80).optional().nullable(),
+    ackNo: z.string().max(80).optional().nullable(),
+    deliveryDate: isoDate.optional().nullable(),
     documentDate: isoDate.optional(),
+
     leadTimeDays: z.number().int().min(1).max(365).optional().nullable()
   }).parse(req.body);
   // Changing the plan itself (PO date / lead time) is a section-admin call.

@@ -107,7 +107,7 @@ function poTable(pos, { showStep = true } = {}) {
     ${td(`<b>${esc(fmtDate(p.etaDate))}</b>`, "white-space:nowrap;")}
   </tr>`).join("");
   return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-    <tr>${th("PO No.")}${th("Supplier")}${showStep ? th("Waiting for") : ""}${th("Due")}${th("Status")}${th("ETA factory")}</tr>
+    <tr>${th("PO No.")}${th("Supplier")}${showStep ? th("Waiting for") : ""}${th("Due")}${th("Status")}${th("Delivery date")}</tr>
     ${rows}
   </table>`;
 }

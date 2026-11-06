@@ -70,7 +70,8 @@ async function main() {
   for (const file of files) {
     const data = fs.readFileSync(file).toString("base64");
     try {
-      const r = await poImport.commit(sectionId, { fileName: path.basename(file), data }, buyer, ctx);
+      // Delivery date (step 7) for the demo: 75 days after today's import.
+      const r = await poImport.commit(sectionId, { fileName: path.basename(file), data, deliveryDate: addDays(todayIso(), 75) }, buyer, ctx);
       console.log(`Imported ${r.created.length} PO(s) from ${path.relative(DATA_DIR, file)}`);
     } catch (err) {
       console.log(`${path.relative(DATA_DIR, file)}: ${err.message}`);
@@ -87,7 +88,7 @@ async function main() {
   for (const po of pos) {
     const age = diffDays(new Date(po.document_date).toISOString().slice(0, 10), today);
     const r = rand(po.po_no);
-    const stopAt = age > 150 ? (r < 0.55 ? 10 : r < 0.8 ? 9 : 8) : age > 60 ? 5 + Math.floor(r * 4) : 2 + Math.floor(r * 3);
+    const stopAt = age > 150 ? (r < 0.55 ? 8 : r < 0.8 ? 7 : 6) : age > 60 ? 4 + Math.floor(r * 3) : 2 + Math.floor(r * 2);
     for (let step = 2; step < stopAt; step += 1) {
       const detail = (await query("SELECT due_date FROM po_steps WHERE po_id = @id AND step_no = @step", { id: po.id, step })).recordset[0];
       const due = new Date(detail.due_date).toISOString().slice(0, 10);
@@ -98,7 +99,9 @@ async function main() {
       if (actual < prevIso) actual = prevIso;
       await advancePo(po.id, sectionId, {
         actualDate: actual,
-        referenceNo: step === 2 ? "141-02-W059" : step === 4 ? "EX-26-W87" : step === 6 ? `INV-${po.po_no.slice(-4)}` : null
+        // Each PO its own Acknowledgment No. (= shipment): POs of one
+        // shipment move together past the S/I step, these go step by step.
+        referenceNo: step === 2 ? `141-02-W${po.po_no.slice(-3)}` : step === 3 ? "EX-26-W87" : step === 4 ? `INV-${po.po_no.slice(-4)}` : null
       }, buyer, ctx);
     }
   }
@@ -127,7 +130,7 @@ async function main() {
       source: "MANUAL",
       po: {
         poNo, supplierId: supplier.id, supplier, supplierCode: supplier.supplier_code, supplierName: supplier.name,
-        documentDate, shipMode: i % 3 === 0 ? "AIR" : "SEA", currency: "JPY", remark: "Demo PO — safe to delete"
+        documentDate, deliveryDate: addDays(documentDate, 75), shipMode: i % 3 === 0 ? "AIR" : "SEA", currency: "JPY", remark: "Demo PO — safe to delete"
       },
       items: [{
         itemNo: "10", materialId: m.id, materialCode: m.material_code, shortText: m.description, vendorMaterial: m.vendor_material,
@@ -135,8 +138,7 @@ async function main() {
       }]
     }, ctx));
     if (recent[i] >= 21) {
-      await advancePo(id, sectionId, { actualDate: addDays(documentDate, 13 + (i % 4)), referenceNo: "141-03-W019" }, buyer, ctx);
-      await advancePo(id, sectionId, { actualDate: addDays(documentDate, 15 + (i % 4)) }, buyer, ctx);
+      await advancePo(id, sectionId, { actualDate: addDays(documentDate, 9 + (i % 4)), referenceNo: "141-03-W019" }, buyer, ctx);
     }
     made += 1;
   }

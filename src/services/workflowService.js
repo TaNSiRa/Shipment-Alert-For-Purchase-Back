@@ -1,68 +1,57 @@
 const { query } = require("../db/pool");
 const { endOfMonth, shift } = require("./dates");
 
-// The purchase process from the "PUR Process" sheet. Nine steps, one input:
-// step 1 (Issue PO = N1) is the only date a person types (or the SAP export
-// supplies); every later step is just "done" with the day it happened.
+// The purchase process, as agreed with Purchase (meeting 2026-11). Seven
+// steps; the dates come from four inputs:
 //
-//   No. Step                                   Lead time (Excel)
-//   1   Issue PO = N1                          N1
-//   2   Acknowledgement (from supplier) = N2   N1+15
-//   3   OCR Acknowledgement to SAP             (with step 2)
-//   4   Shipping Instruction = N3              N2+40   <- flex, see below
-//   5   OCR Shipping Instruction to SAP        (with step 4)
-//   6   Supplier sends shipping docs = N4      N3+10
-//   7   Clearing & delivery to TP = N5         N4+7
-//   8   Input Declaration                      N5+1
-//   9   Factory goods received                 N5+2    <- arrival
+//   No. Step                                              Lead time   Input
+//   1   Issue PO = N1                                     N1          1  DATA EXPORT BY SAP (+ Delivery date)
+//   2   OCR Acknowledgement from SAP = N2                 N1+10       2  OCR ACK file (Acknowledgment No. = shipment)
+//   3   OCR Shipping Instruction from SAP = N3            N2+20       3  OCR SI file (ETD / ETA)
+//   4   Supplier sends shipping documents = N4            N3+15
+//   5   Process clearing and delivery to TP = N5          N4+5
+//   6   Input Declaration                                 N5+1
+//   7   Factory good received                             Delivery date (Input 1, editable any time)
 //
-// The sheet's 10th line, "Monthly report", is not a step of a shipment: it is
-// the month-end email/report (mailScheduler + Monthly Report page), so a PO is
-// complete once its goods are received.
+// Steps 2 and 3 are normally closed by uploading the OCR files; the "Mark
+// done" button stays for when a file has a problem. The arrival step's due
+// date is the PO's Delivery date (typed at import); its anchor/offset is only
+// the fallback for a PO that has none. The ETA in the OCR SI file is shown on
+// the PO but does not move step 7.
 //
-// "Flex" step: the S/I wait is mostly the supplier's production time, which is
-// what the material master's lead time measures. When the section has
-// workflow.useMaterialLeadTime on, the flex step's offset is stretched so the
-// arrival step lands on PO date + lead time (the longest of the PO's lines);
-// with it off, the fixed +40 is used. The default 15+40+10+7+2 = 74 days
-// matches the sheet's own 75-day total.
+// Every due date comes from these lead times alone. The material master's
+// lead time no longer stretches any step (removed, Purchase 2026-11): the
+// longest material on a PO does not change its plan. workflow_steps.is_flex
+// is kept in the table but ignored.
 const DEFAULT_STEPS = [
   { stepNo: 1, code: "ISSUE_PO", name: "Issue PO", shortName: "Issue PO", milestone: "N1",
     anchorStepNo: null, offsetDays: 0, offsetMode: "DAYS", isFlex: false, isArrival: false,
     referenceLabel: null, icon: "receipt_long",
     description: "Purchase order issued to the supplier. Its date (SAP Document Date) is N1, the start of the plan." },
-  { stepNo: 2, code: "ACK", name: "Acknowledgement (from supplier)", shortName: "ACK", milestone: "N2",
-    anchorStepNo: 1, offsetDays: 15, offsetMode: "DAYS", isFlex: false, isArrival: false,
-    referenceLabel: "ACK No.", icon: "mark_email_read",
-    description: "Supplier confirms the order and gives the expected shipping date." },
-  { stepNo: 3, code: "OCR_ACK", name: "OCR Acknowledgement to SAP", shortName: "OCR ACK", milestone: null,
-    anchorStepNo: 2, offsetDays: 0, offsetMode: "DAYS", isFlex: false, isArrival: false,
-    referenceLabel: null, icon: "document_scanner",
-    description: "Key the supplier acknowledgement into SAP." },
-  { stepNo: 4, code: "SI", name: "Shipping Instruction (from supplier)", shortName: "S/I", milestone: "N3",
-    anchorStepNo: 2, offsetDays: 40, offsetMode: "DAYS", isFlex: true, isArrival: false,
-    referenceLabel: "S/I / Shipment No.", icon: "directions_boat",
-    description: "Supplier finishes production and sends the shipping instruction (ETD / ETA)." },
-  { stepNo: 5, code: "OCR_SI", name: "OCR Shipping Instruction to SAP", shortName: "OCR S/I", milestone: null,
-    anchorStepNo: 4, offsetDays: 0, offsetMode: "DAYS", isFlex: false, isArrival: false,
-    referenceLabel: null, icon: "document_scanner",
-    description: "Key the shipping instruction into SAP." },
-  { stepNo: 6, code: "SHIP_DOC", name: "Shipping documents from supplier (Invoice + P/L + B/L)", shortName: "Ship Docs",
-    milestone: "N4", anchorStepNo: 4, offsetDays: 10, offsetMode: "DAYS", isFlex: false, isArrival: false,
+  { stepNo: 2, code: "ACK", name: "OCR Acknowledgement from SAP", shortName: "OCR ACK", milestone: "N2",
+    anchorStepNo: 1, offsetDays: 10, offsetMode: "DAYS", isFlex: false, isArrival: false,
+    referenceLabel: "Acknowledgment No.", icon: "document_scanner",
+    description: "Upload the OCR ACK file from SAP. Its Acknowledgment No. groups the POs into one shipment." },
+  { stepNo: 3, code: "SI", name: "OCR Shipping Instruction from SAP", shortName: "OCR S/I", milestone: "N3",
+    anchorStepNo: 2, offsetDays: 20, offsetMode: "DAYS", isFlex: false, isArrival: false,
+    referenceLabel: "S/I No.", icon: "directions_boat",
+    description: "Upload the OCR SI file from SAP. It brings the shipment's ETD and ETA." },
+  { stepNo: 4, code: "SHIP_DOC", name: "Supplier send shipping document (Invoice + Packing list + BL)", shortName: "Ship Docs",
+    milestone: "N4", anchorStepNo: 3, offsetDays: 15, offsetMode: "DAYS", isFlex: false, isArrival: false,
     referenceLabel: "Invoice No.", icon: "description",
     description: "Supplier sends invoice, packing list and bill of lading." },
-  { stepNo: 7, code: "CLEARING", name: "Customs clearing & delivery to TP", shortName: "Clearing", milestone: "N5",
-    anchorStepNo: 6, offsetDays: 7, offsetMode: "DAYS", isFlex: false, isArrival: false,
+  { stepNo: 5, code: "CLEARING", name: "Process Clearing and delivery to TP", shortName: "Clearing", milestone: "N5",
+    anchorStepNo: 4, offsetDays: 5, offsetMode: "DAYS", isFlex: false, isArrival: false,
     referenceLabel: null, icon: "local_shipping",
     description: "Shipping agent clears customs and delivers to the factory." },
-  { stepNo: 8, code: "DECLARATION", name: "Input Declaration", shortName: "Declaration", milestone: null,
-    anchorStepNo: 7, offsetDays: 1, offsetMode: "DAYS", isFlex: false, isArrival: false,
+  { stepNo: 6, code: "DECLARATION", name: "Input Declaration", shortName: "Declaration", milestone: null,
+    anchorStepNo: 5, offsetDays: 1, offsetMode: "DAYS", isFlex: false, isArrival: false,
     referenceLabel: "Declaration No.", icon: "assignment",
     description: "Key the import declaration." },
-  { stepNo: 9, code: "GOODS_RECEIVED", name: "Factory goods received", shortName: "Received", milestone: null,
-    anchorStepNo: 7, offsetDays: 2, offsetMode: "DAYS", isFlex: false, isArrival: true,
+  { stepNo: 7, code: "GOODS_RECEIVED", name: "Factory good received", shortName: "Received", milestone: null,
+    anchorStepNo: 5, offsetDays: 2, offsetMode: "DAYS", isFlex: false, isArrival: true,
     referenceLabel: null, icon: "warehouse",
-    description: "Goods arrive at the factory — this is the shipment's ETA." }
+    description: "Goods arrive at the factory. Due on the PO's Delivery date (entered at import, editable any time)." }
 ];
 
 const STEP_COUNT = DEFAULT_STEPS.length;
@@ -80,7 +69,7 @@ function fromRow(row) {
     anchorStepNo: row.anchor_step_no,
     offsetDays: row.offset_days,
     offsetMode: row.offset_mode,
-    isFlex: row.is_flex === true || row.is_flex === 1,
+    isFlex: false,
     isArrival: row.is_arrival === true || row.is_arrival === 1,
     referenceLabel: row.reference_label,
     icon: row.icon
@@ -132,65 +121,35 @@ function validateWorkflow(steps) {
     }
     if (!["DAYS", "END_OF_MONTH"].includes(s.offsetMode)) problems.push(`Step ${s.stepNo}: unknown offset mode`);
   }
-  if (steps.filter(s => s.isFlex).length > 1) problems.push("Only one step can absorb the material lead time");
   if (steps.filter(s => s.isArrival).length !== 1) problems.push("Exactly one step must be the arrival (ETA) step");
-  if (steps.some(s => s.isFlex && (s.stepNo === 1 || s.offsetMode !== "DAYS"))) {
-    problems.push("The lead-time step must be a later step counted in days");
-  }
   return problems;
-}
-
-// Offsets on the anchor chain from the arrival step back to step 1, used to
-// decide how long the flex step has to be.
-function arrivalChain(steps) {
-  const byNo = new Map(steps.map(s => [s.stepNo, s]));
-  const arrival = steps.find(s => s.isArrival);
-  const chain = [];
-  let current = arrival;
-  let guard = 0;
-  while (current && current.stepNo !== 1 && guard < STEP_COUNT + 1) {
-    chain.push(current);
-    current = byNo.get(current.anchorStepNo);
-    guard += 1;
-  }
-  return chain;
-}
-
-// The flex step's day count for a PO with this lead time, or its configured
-// offset when lead-time stretching is off / not applicable.
-function flexOffsetFor(steps, leadTimeDays, settings) {
-  const flex = steps.find(s => s.isFlex);
-  if (!flex) return null;
-  if (!settings.useMaterialLeadTime || !Number.isFinite(leadTimeDays) || leadTimeDays <= 0) return flex.offsetDays;
-  const chain = arrivalChain(steps);
-  if (!chain.some(s => s.stepNo === flex.stepNo)) return flex.offsetDays;
-  const others = chain
-    .filter(s => s.stepNo !== flex.stepNo)
-    .reduce((sum, s) => sum + (s.offsetMode === "DAYS" ? s.offsetDays : 0), 0);
-  return Math.max(settings.minFlexDays ?? 0, leadTimeDays - others);
 }
 
 // Due date of every step.
 //   documentDate — N1
 //   actuals      — Map/obj stepNo -> actual ISO date of the steps already done
+//   deliveryDate — the PO's Delivery date: the arrival step's due date when set
 // A step's due date counts from its anchor's ACTUAL date once the anchor is
 // done (so a late acknowledgement pushes the rest of the plan), or from the
 // anchor's due date while it is still open.
-function computeSchedule({ steps, documentDate, leadTimeDays, actuals = {}, settings, holidays }) {
+// (leadTimeDays is accepted and ignored: callers may still pass it.)
+function computeSchedule({ steps, documentDate, actuals = {}, settings, holidays, deliveryDate = null }) {
   const actualOf = n => (actuals instanceof Map ? actuals.get(n) : actuals[n]) || null;
-  const flexDays = flexOffsetFor(steps, leadTimeDays, settings);
   const due = {};
   for (const s of [...steps].sort((a, b) => a.stepNo - b.stepNo)) {
     if (s.stepNo === 1) {
       due[1] = documentDate;
       continue;
     }
+    if (s.isArrival && deliveryDate) {
+      due[s.stepNo] = deliveryDate;
+      continue;
+    }
     const base = actualOf(s.anchorStepNo) || due[s.anchorStepNo] || documentDate;
     if (s.offsetMode === "END_OF_MONTH") {
       due[s.stepNo] = endOfMonth(base);
     } else {
-      const days = s.isFlex && flexDays !== null ? flexDays : s.offsetDays;
-      due[s.stepNo] = shift(base, days, settings.dayMode, holidays);
+      due[s.stepNo] = shift(base, s.offsetDays, settings.dayMode, holidays);
     }
   }
   return due;
@@ -200,6 +159,11 @@ function arrivalStepNo(steps) {
   return (steps.find(s => s.isArrival) || steps[steps.length - 1] || { stepNo: STEP_COUNT }).stepNo;
 }
 
+// The step a file upload closes (by code, so a renamed step still works).
+function stepNoOf(steps, code, fallback) {
+  return steps.find(s => s.code === code)?.stepNo ?? fallback;
+}
+
 module.exports = {
   DEFAULT_STEPS,
   DONE_STEP,
@@ -207,8 +171,8 @@ module.exports = {
   STEP_COUNT,
   arrivalStepNo,
   computeSchedule,
-  flexOffsetFor,
   getWorkflow,
   insertDefaultSteps,
+  stepNoOf,
   validateWorkflow
 };

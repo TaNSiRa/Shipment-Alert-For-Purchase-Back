@@ -1,6 +1,6 @@
 const { query, withTransaction } = require("../db/pool");
 const { diffDays, isIsoDate, todayIso } = require("./dates");
-const { DONE_STEP, FIRST_OPEN_STEP, STEP_COUNT, arrivalStepNo, computeSchedule, getWorkflow } = require("./workflowService");
+const { DONE_STEP, FIRST_OPEN_STEP, STEP_COUNT, arrivalStepNo, computeSchedule, getWorkflow, stepNoOf } = require("./workflowService");
 const { getHolidaySet, getSectionSettings, scheduleSettings } = require("./settingsService");
 const { bool, num, toIso, wallTime } = require("./serialize");
 
@@ -41,13 +41,14 @@ async function insertItem(runner, poId, item) {
     `INSERT INTO po_items (po_id, item_no, material_id, material_code, short_text, vendor_material, material_type,
        material_group, order_qty, order_unit, net_price, currency, qty_sku, sku_unit, lead_time_days,
        po_history_release, doc_category, order_price_unit, price_unit, still_to_invoice_qty, still_to_invoice_val,
-       deletion_indicator, item_category, acct_assignment_cat, source_row, raw_data)
+       deletion_indicator, item_category, acct_assignment_cat, source_row, raw_data, ack_qty)
      VALUES (@poId, @itemNo, @materialId, @materialCode, @shortText, @vendorMaterial, @materialType,
        @materialGroup, @orderQty, @orderUnit, @netPrice, @currency, @qtySku, @skuUnit, @leadTimeDays,
        @poHistory, @docCategory, @orderPriceUnit, @priceUnit, @stillQty, @stillVal,
-       @deletionIndicator, @itemCategory, @acctAssignment, @sourceRow, @raw)`,
+       @deletionIndicator, @itemCategory, @acctAssignment, @sourceRow, @raw, @ackQty)`,
     {
       poId,
+      ackQty: num(item.ackQty),
       itemNo: item.itemNo || null,
       materialId: item.materialId || null,
       materialCode: item.materialCode || null,
@@ -77,10 +78,11 @@ async function insertItem(runner, poId, item) {
   );
 }
 
-// Creates one PO with its lines and its ten step rows. `runner` is a
+// Creates one PO with its lines and its step rows. `runner` is a
 // transaction from withTransaction (imports create many POs in one).
 //   po: { poNo, supplierId, supplierCode, supplierName, documentDate, docType,
-//         plant, shipMode, currency, remark, leadTimeDays?, leadTimeSource? }
+//         plant, shipMode, currency, remark, leadTimeDays?, leadTimeSource?,
+//         deliveryDate?, splitNo?, splitFromId?, ackNo?, ackEtdText? }
 //   items: [{ itemNo, materialId, materialCode, shortText, vendorMaterial,
 //            materialType, materialGroup, orderQty, orderUnit, netPrice,
 //            currency, qtySku, skuUnit, leadTimeDays }]
@@ -101,19 +103,27 @@ async function createPo(runner, { sectionId, po, items, userId, source, batchId 
     leadTimeDays: lead.days,
     actuals: { 1: po.documentDate },
     settings: ctx.sched,
-    holidays: ctx.holidays
+    holidays: ctx.holidays,
+    deliveryDate: po.deliveryDate || null
   });
   const arrival = arrivalStepNo(ctx.steps);
 
   const inserted = (await runner.query(
     `INSERT INTO purchase_orders (section_id, po_no, supplier_id, supplier_code, supplier_name, document_date,
        doc_type, plant, ship_mode, currency, total_value, lead_time_days, lead_time_source, current_step, status,
-       next_due_date, eta_date, remark, source, import_batch_id, created_by)
+       next_due_date, eta_date, remark, source, import_batch_id, created_by, delivery_date, split_no, split_from_id,
+       ack_no, ack_etd_text)
      OUTPUT INSERTED.id
      VALUES (@sectionId, @poNo, @supplierId, @supplierCode, @supplierName, @documentDate,
        @docType, @plant, @shipMode, @currency, @totalValue, @leadDays, @leadSource, @currentStep, 'ACTIVE',
-       @nextDue, @eta, @remark, @source, @batchId, @userId)`,
+       @nextDue, @eta, @remark, @source, @batchId, @userId, @deliveryDate, @splitNo, @splitFromId,
+       @ackNo, @ackEtdText)`,
     {
+      deliveryDate: po.deliveryDate || null,
+      splitNo: po.splitNo || 0,
+      splitFromId: po.splitFromId || null,
+      ackNo: po.ackNo || null,
+      ackEtdText: po.ackEtdText || null,
       sectionId,
       poNo: po.poNo,
       supplierId: po.supplierId || null,
@@ -157,7 +167,10 @@ async function createPo(runner, { sectionId, po, items, userId, source, batchId 
   await addHistory(runner, poId, "CREATED", {
     stepNo: 1,
     actorId: userId,
-    detail: { source, items: live.length, leadTimeDays: lead.days, leadTimeSource: lead.source, documentDate: po.documentDate }
+    detail: {
+      source, items: live.length, leadTimeDays: lead.days, leadTimeSource: lead.source, documentDate: po.documentDate,
+      deliveryDate: po.deliveryDate || null, splitFrom: po.splitFromPoNo || null, ackNo: po.ackNo || null
+    }
   });
   return poId;
 }
@@ -169,7 +182,7 @@ async function createPo(runner, { sectionId, po, items, userId, source, batchId 
 // PO date or lead time itself is edited).
 async function recomputePo(runner, poId, ctx, { rebaseline = false } = {}) {
   const po = (await runner.query(
-    "SELECT id, document_date, lead_time_days, current_step, status FROM purchase_orders WHERE id = @poId",
+    "SELECT id, document_date, lead_time_days, current_step, status, delivery_date FROM purchase_orders WHERE id = @poId",
     { poId }
   )).recordset[0];
   if (!po) return;
@@ -180,13 +193,15 @@ async function recomputePo(runner, poId, ctx, { rebaseline = false } = {}) {
   const actuals = {};
   for (const r of stepRows) if (r.actual_date) actuals[r.step_no] = toIso(r.actual_date);
   const documentDate = toIso(po.document_date);
+  const deliveryDate = toIso(po.delivery_date);
   const due = computeSchedule({
     steps: ctx.steps,
     documentDate,
     leadTimeDays: po.lead_time_days,
     actuals,
     settings: ctx.sched,
-    holidays: ctx.holidays
+    holidays: ctx.holidays,
+    deliveryDate
   });
   const plan = rebaseline
     ? computeSchedule({
@@ -195,7 +210,8 @@ async function recomputePo(runner, poId, ctx, { rebaseline = false } = {}) {
       leadTimeDays: po.lead_time_days,
       actuals: { 1: documentDate },
       settings: ctx.sched,
-      holidays: ctx.holidays
+      holidays: ctx.holidays,
+      deliveryDate
     })
     : null;
   for (const r of stepRows) {
@@ -236,9 +252,125 @@ function cleanText(value, max) {
   return text ? text.slice(0, max) : null;
 }
 
+// The PO's shipment: the other POs with the same Acknowledgment No. (they
+// travel together). Cancelled POs are left out. lock = UPDLOCK for a write.
+async function shipmentMates(runner, po, sectionId, { lock = false } = {}) {
+  const ackNo = `${po.ack_no ?? ""}`.trim();
+  if (!ackNo) return [];
+  return (await runner.query(
+    `SELECT id, po_no, split_no, current_step, status, supplier_name
+     FROM purchase_orders ${lock ? "WITH (UPDLOCK, ROWLOCK)" : ""}
+     WHERE section_id = @sectionId AND ack_no = @ackNo AND id <> @poId AND status <> 'CANCELLED'
+     ORDER BY po_no, split_no`,
+    { sectionId, ackNo, poId: po.id }
+  )).recordset;
+}
+
+const poLabel = p => `${p.po_no}${p.split_no ? ` #${p.split_no}` : ""}`;
+
+// The steps after the S/I step (shipping documents … goods received) belong
+// to the shipment, not to one PO: closing one closes it on every PO of the
+// shipment waiting at the same step — and only once every PO of the shipment
+// is past the S/I step (blockers = the ones that are not).
+function shipmentRule(po, mates, stepNo, ctx) {
+  const siStep = stepNoOf(ctx.steps, "SI", 3);
+  const ackNo = `${po.ack_no ?? ""}`.trim() || null;
+  if (!ackNo || stepNo <= siStep || !mates.length) {
+    return { ackNo, siStep, together: false, blockers: [], mates: [] };
+  }
+  return {
+    ackNo,
+    siStep,
+    together: true,
+    blockers: mates.filter(m => m.status === "ACTIVE" && m.current_step <= siStep),
+    mates: mates.filter(m => m.status === "ACTIVE" && m.current_step === stepNo)
+  };
+}
+
+function blockedMessage(rule) {
+  const list = rule.blockers.map(b => `${poLabel(b)} (step ${b.current_step})`).join(", ");
+  return `Shipment ${rule.ackNo}: PO ${list} ${rule.blockers.length === 1 ? "is" : "are"} not past step ${rule.siStep} yet — `
+    + `every PO of the shipment must pass step ${rule.siStep} before the shipment moves on`;
+}
+
+// What "Mark done" on this PO also moves (GET /pos/:id/shipment).
+async function getShipment(poId, sectionId, ctx) {
+  const po = (await query(
+    "SELECT id, po_no, split_no, ack_no, current_step, status FROM purchase_orders WHERE id = @poId AND section_id = @sectionId",
+    { poId, sectionId }
+  )).recordset[0];
+  if (!po) throw httpError(404, "PO not found");
+  const mates = await shipmentMates({ query }, po, sectionId);
+  const rule = shipmentRule(po, mates, po.current_step, ctx);
+  const view = m => ({
+    id: m.id, poNo: m.po_no, splitNo: m.split_no, currentStep: m.current_step, status: m.status, supplierName: m.supplier_name
+  });
+  return {
+    ackNo: rule.ackNo,
+    stepNo: po.current_step,
+    together: rule.together,
+    pos: mates.map(view),
+    moveWith: rule.mates.map(view),
+    // What "Undo last step" on this PO also reopens.
+    undoWith: shipmentUndoMates(po, mates, ctx).map(view),
+    blockers: rule.blockers.map(view),
+    message: rule.blockers.length ? blockedMessage(rule) : null
+  };
+}
+
+// Closes step stepNo of one locked PO.
+async function closeStep(tx, po, stepNo, { actualDate, referenceNo, remark, user, ctx, shipment = null }) {
+  const poId = po.id;
+  const prev = (await tx.query(
+    "SELECT actual_date FROM po_steps WHERE po_id = @poId AND step_no = @n",
+    { poId, n: stepNo - 1 }
+  )).recordset[0];
+  const prevActual = toIso(prev?.actual_date);
+  if (prevActual && actualDate < prevActual) {
+    throw httpError(400, `The actual date cannot be before the previous step${shipment ? ` of PO ${poLabel(po)}` : ""} (${prevActual})`);
+  }
+  const stepRow = (await tx.query(
+    "SELECT due_date FROM po_steps WHERE po_id = @poId AND step_no = @n",
+    { poId, n: stepNo }
+  )).recordset[0];
+  const dueDate = toIso(stepRow?.due_date);
+
+  await tx.query(
+    `UPDATE po_steps SET actual_date = @actualDate, done_by = @userId,
+       done_at = DATEADD(HOUR, 7, SYSUTCDATETIME()), reference_no = @referenceNo, remark = @remark
+     WHERE po_id = @poId AND step_no = @n`,
+    { poId, n: stepNo, actualDate, userId: user.id, referenceNo, remark }
+  );
+  const next = stepNo + 1;
+  const step = ctx.steps.find(s => s.stepNo === stepNo);
+  // The ACK step's reference is the Acknowledgment No. (= the shipment), the
+  // S/I step's the S/I No. — the same fields the OCR uploads fill.
+  const setShipmentRef = step?.code === "SI" && referenceNo;
+  const setAckNo = step?.code === "ACK" && referenceNo;
+  await tx.query(
+    `UPDATE purchase_orders SET current_step = @next,
+       status = CASE WHEN @next > @stepCount THEN 'COMPLETED' ELSE status END,
+       completed_at = CASE WHEN @next > @stepCount THEN DATEADD(HOUR, 7, SYSUTCDATETIME()) ELSE completed_at END,
+       shipment_ref = CASE WHEN @setRef = 1 THEN @referenceNo ELSE shipment_ref END,
+       ack_no = CASE WHEN @setAck = 1 THEN @referenceNo ELSE ack_no END,
+       updated_by = @userId, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
+     WHERE id = @poId`,
+    { poId, next, stepCount: STEP_COUNT, setRef: setShipmentRef ? 1 : 0, setAck: setAckNo ? 1 : 0, referenceNo, userId: user.id }
+  );
+  await recomputePo(tx, poId, ctx);
+  const lateDays = dueDate ? diffDays(dueDate, actualDate) : null;
+  await addHistory(tx, poId, "STEP_DONE", {
+    stepNo,
+    actorId: user.id,
+    detail: { stepName: step?.name, actualDate, dueDate, lateDays, referenceNo, remark, ...(shipment ? { shipment } : {}) }
+  });
+  return { id: poId, poNo: po.po_no, splitNo: po.split_no, stepNo, nextStep: next, completed: next > STEP_COUNT };
+}
+
 // Marks the PO's current step done. expectedStep makes a double click, two
 // people on the same PO, or a stale bulk selection fail loudly (409) instead
-// of silently closing the NEXT step.
+// of silently closing the NEXT step. A step after the S/I step is closed on
+// the whole shipment at once (see shipmentRule) — all or nothing.
 async function advancePo(poId, sectionId, input, user, ctx) {
   const actualDate = input.actualDate || todayIso();
   if (!isIsoDate(actualDate)) throw httpError(400, "Actual date must be a valid date");
@@ -252,86 +384,93 @@ async function advancePo(poId, sectionId, input, user, ctx) {
       throw httpError(409, `PO ${po.po_no} has already moved on (it is now at step ${po.current_step}). Refresh and try again.`);
     }
     const stepNo = po.current_step;
-    const prev = (await tx.query(
-      "SELECT actual_date FROM po_steps WHERE po_id = @poId AND step_no = @n",
-      { poId, n: stepNo - 1 }
-    )).recordset[0];
-    const prevActual = toIso(prev?.actual_date);
-    if (prevActual && actualDate < prevActual) {
-      throw httpError(400, `The actual date cannot be before the previous step (${prevActual})`);
-    }
-    const stepRow = (await tx.query(
-      "SELECT due_date FROM po_steps WHERE po_id = @poId AND step_no = @n",
-      { poId, n: stepNo }
-    )).recordset[0];
-    const dueDate = toIso(stepRow?.due_date);
-    const referenceNo = cleanText(input.referenceNo, 80);
-    const remark = cleanText(input.remark, 500);
-
-    await tx.query(
-      `UPDATE po_steps SET actual_date = @actualDate, done_by = @userId,
-         done_at = DATEADD(HOUR, 7, SYSUTCDATETIME()), reference_no = @referenceNo, remark = @remark
-       WHERE po_id = @poId AND step_no = @n`,
-      { poId, n: stepNo, actualDate, userId: user.id, referenceNo, remark }
-    );
-    const next = stepNo + 1;
-    const step = ctx.steps.find(s => s.stepNo === stepNo);
-    const setShipmentRef = step?.code === "SI" && referenceNo;
-    await tx.query(
-      `UPDATE purchase_orders SET current_step = @next,
-         status = CASE WHEN @next > @stepCount THEN 'COMPLETED' ELSE status END,
-         completed_at = CASE WHEN @next > @stepCount THEN DATEADD(HOUR, 7, SYSUTCDATETIME()) ELSE completed_at END,
-         shipment_ref = CASE WHEN @setRef = 1 THEN @referenceNo ELSE shipment_ref END,
-         updated_by = @userId, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
-       WHERE id = @poId`,
-      { poId, next, stepCount: STEP_COUNT, setRef: setShipmentRef ? 1 : 0, referenceNo, userId: user.id }
-    );
-    await recomputePo(tx, poId, ctx);
-    const lateDays = dueDate ? diffDays(dueDate, actualDate) : null;
-    await addHistory(tx, poId, "STEP_DONE", {
-      stepNo,
-      actorId: user.id,
-      detail: { stepName: step?.name, actualDate, dueDate, lateDays, referenceNo, remark }
-    });
-    return { id: poId, poNo: po.po_no, stepNo, nextStep: next, completed: next > STEP_COUNT };
+    const rule = shipmentRule(po, await shipmentMates(tx, po, sectionId, { lock: true }), stepNo, ctx);
+    if (rule.blockers.length) throw httpError(400, blockedMessage(rule));
+    const opts = {
+      actualDate, user, ctx,
+      referenceNo: cleanText(input.referenceNo, 80),
+      remark: cleanText(input.remark, 500),
+      shipment: rule.mates.length ? rule.ackNo : null
+    };
+    const result = await closeStep(tx, po, stepNo, opts);
+    const withShipment = [];
+    for (const m of rule.mates) withShipment.push(await closeStep(tx, m, stepNo, opts));
+    return { ...result, shipment: rule.together ? rule.ackNo : null, withShipment };
   });
 }
 
+// The POs of the shipment that "Undo" on po also reopens: past the S/I step,
+// the others of the shipment standing right after the same step.
+function shipmentUndoMates(po, mates, ctx) {
+  const siStep = stepNoOf(ctx.steps, "SI", 3);
+  const last = po.current_step - 1;
+  if (!`${po.ack_no ?? ""}`.trim() || last <= siStep) return [];
+  return mates.filter(m => ["ACTIVE", "COMPLETED"].includes(m.status) && m.current_step === po.current_step);
+}
+
 // Reopens the most recently closed step. Allowed for a section admin, or for
-// the person who closed it.
+// the person who closed it. Past the S/I step the step is reopened on the
+// whole shipment (same Acknowledgment No.) — all or nothing.
 async function undoLastStep(poId, sectionId, user, access, ctx) {
   return withTransaction(async tx => {
     const po = await lockPo(tx, poId, sectionId);
     if (po.status === "CANCELLED") throw httpError(400, `PO ${po.po_no} is cancelled — reopen it first`);
     const last = po.current_step - 1;
     if (last < FIRST_OPEN_STEP) throw httpError(400, "There is no completed step to undo");
-    const row = (await tx.query(
-      "SELECT actual_date, done_by, reference_no FROM po_steps WHERE po_id = @poId AND step_no = @n",
-      { poId, n: last }
-    )).recordset[0];
-    if (!access.isSectionAdmin && Number(row?.done_by) !== Number(user.id)) {
-      throw httpError(403, "Only the person who completed this step, or a section admin, can undo it");
-    }
-    await tx.query(
-      `UPDATE po_steps SET actual_date = NULL, done_by = NULL, done_at = NULL, reference_no = NULL, remark = NULL
-       WHERE po_id = @poId AND step_no = @n`,
-      { poId, n: last }
-    );
-    await tx.query(
-      `UPDATE purchase_orders SET current_step = @last, status = 'ACTIVE', completed_at = NULL,
-         updated_by = @userId, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
-       WHERE id = @poId`,
-      { poId, last, userId: user.id }
-    );
-    await recomputePo(tx, poId, ctx);
-    const step = ctx.steps.find(s => s.stepNo === last);
-    await addHistory(tx, poId, "STEP_UNDONE", {
-      stepNo: last,
-      actorId: user.id,
-      detail: { stepName: step?.name, actualDate: toIso(row?.actual_date), referenceNo: row?.reference_no }
-    });
-    return { id: poId, poNo: po.po_no, stepNo: last };
+    const mates = shipmentUndoMates(po, await shipmentMates(tx, po, sectionId, { lock: true }), ctx);
+    const shipment = mates.length ? `${po.ack_no}`.trim() : null;
+    const result = await reopenStep(tx, po, last, { user, access, ctx, shipment });
+    const withShipment = [];
+    for (const m of mates) withShipment.push(await reopenStep(tx, m, last, { user, access, ctx, shipment }));
+    return { ...result, shipment, withShipment };
   });
+}
+
+// Reopens step `last` of one locked PO.
+async function reopenStep(tx, po, last, { user, access, ctx, shipment = null }) {
+  const poId = po.id;
+  const row = (await tx.query(
+    "SELECT actual_date, done_by, reference_no FROM po_steps WHERE po_id = @poId AND step_no = @n",
+    { poId, n: last }
+  )).recordset[0];
+  if (!access.isSectionAdmin && Number(row?.done_by) !== Number(user.id)) {
+    throw httpError(403, shipment
+      ? `Step ${last} of PO ${poLabel(po)} (shipment ${shipment}) was completed by someone else — only that person or a section admin can undo it`
+      : "Only the person who completed this step, or a section admin, can undo it");
+  }
+  await tx.query(
+    `UPDATE po_steps SET actual_date = NULL, done_by = NULL, done_at = NULL, reference_no = NULL, remark = NULL
+     WHERE po_id = @poId AND step_no = @n`,
+    { poId, n: last }
+  );
+  // Undoing the ACK / S/I step also takes back what it brought in (the
+  // Acknowledgment No., or the S/I No. with its ETD / ETA and quantities).
+  const code = ctx.steps.find(s => s.stepNo === last)?.code;
+  const clearAck = code === "ACK" ? 1 : 0;
+  const clearSi = code === "SI" ? 1 : 0;
+  await tx.query(
+    `UPDATE purchase_orders SET current_step = @last, status = 'ACTIVE', completed_at = NULL,
+       ack_no = CASE WHEN @clearAck = 1 THEN NULL ELSE ack_no END,
+       ack_etd_text = CASE WHEN @clearAck = 1 THEN NULL ELSE ack_etd_text END,
+       shipment_ref = CASE WHEN @clearSi = 1 AND shipment_ref = @ref THEN NULL ELSE shipment_ref END,
+       etd_date = CASE WHEN @clearSi = 1 THEN NULL ELSE etd_date END,
+       si_eta_date = CASE WHEN @clearSi = 1 THEN NULL ELSE si_eta_date END,
+       updated_by = @userId, updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
+     WHERE id = @poId`,
+    { poId, last, userId: user.id, clearAck, clearSi, ref: row?.reference_no || "" }
+  );
+  if (clearAck) await tx.query("UPDATE po_items SET ack_qty = NULL WHERE po_id = @poId", { poId });
+  if (clearSi) await tx.query("UPDATE po_items SET si_qty = NULL WHERE po_id = @poId", { poId });
+  await recomputePo(tx, poId, ctx);
+  const step = ctx.steps.find(s => s.stepNo === last);
+  await addHistory(tx, poId, "STEP_UNDONE", {
+    stepNo: last,
+    actorId: user.id,
+    detail: {
+      stepName: step?.name, actualDate: toIso(row?.actual_date), referenceNo: row?.reference_no, ...(shipment ? { shipment } : {})
+    }
+  });
+  return { id: poId, poNo: po.po_no, splitNo: po.split_no, stepNo: last };
 }
 
 async function cancelPo(poId, sectionId, reason, user) {
@@ -385,6 +524,23 @@ async function updatePo(poId, sectionId, input, user, ctx) {
     text("remark", "remark", 1000);
     text("shipMode", "ship_mode", 20);
     text("shipmentRef", "shipment_ref", 80);
+    text("ackNo", "ack_no", 80);
+
+    // Delivery date = step 7's due date. Editable at any time, even once the
+    // goods are in: it is the date the factory was told, not a computed one.
+    let deliveryChanged = false;
+    if (input.deliveryDate !== undefined && input.deliveryDate !== null) {
+      if (!isIsoDate(input.deliveryDate)) throw httpError(400, "Delivery date must be a valid date");
+      const current = toIso(po.delivery_date);
+      if (current !== input.deliveryDate) {
+        const poDate = input.documentDate || toIso(po.document_date);
+        if (input.deliveryDate < poDate) throw httpError(400, "Delivery date cannot be before the PO date");
+        changes.deliveryDate = { from: current, to: input.deliveryDate };
+        sets.push("delivery_date = @deliveryDate");
+        params.deliveryDate = input.deliveryDate;
+        deliveryChanged = true;
+      }
+    }
 
     let replan = false;
     if (input.documentDate !== undefined) {
@@ -424,7 +580,15 @@ async function updatePo(poId, sectionId, input, user, ctx) {
     if (params.documentDate) {
       await tx.query("UPDATE po_steps SET actual_date = @documentDate WHERE po_id = @poId AND step_no = 1", params);
     }
+    if (deliveryChanged) {
+      // Done or not, step 7 is now due on the new date (plan included).
+      await tx.query(
+        "UPDATE po_steps SET due_date = @deliveryDate, planned_date = @deliveryDate WHERE po_id = @poId AND step_no = @arrival",
+        { poId, deliveryDate: params.deliveryDate, arrival: arrivalStepNo(ctx.steps) }
+      );
+    }
     if (replan) await recomputePo(tx, poId, ctx, { rebaseline: true });
+    else if (deliveryChanged) await recomputePo(tx, poId, ctx);
     await addHistory(tx, poId, "EDITED", { actorId: user.id, detail: changes });
     return { id: poId, poNo: po.po_no, changed: true };
   });
@@ -459,6 +623,7 @@ async function recomputeSection(sectionId) {
 const PO_COLUMNS = `p.id, p.po_no, p.supplier_id, p.supplier_code, p.supplier_name, s.short_name AS supplier_short,
   p.document_date, p.doc_type, p.plant, p.ship_mode, p.currency, p.total_value, p.lead_time_days, p.lead_time_source,
   p.current_step, p.status, p.shipment_ref, p.next_due_date, p.eta_date, p.remark, p.source,
+  p.delivery_date, p.ack_no, p.ack_etd_text, p.etd_date, p.si_eta_date, p.split_no, p.split_from_id,
   p.created_at, p.updated_at, p.completed_at, p.cancelled_at, p.cancel_reason,
   cu.display_name AS created_by_name, uu.display_name AS updated_by_name,
   (SELECT COUNT(1) FROM po_items i WHERE i.po_id = p.id AND i.deletion_indicator IS NULL) AS item_count,
@@ -494,6 +659,13 @@ function serializePo(row, steps, today = todayIso(), dueSoonDays = 3) {
     currentStepShort: step ? step.shortName : row.current_step > STEP_COUNT ? "Done" : null,
     status: row.status,
     shipmentRef: row.shipment_ref,
+    ackNo: row.ack_no || null,
+    ackEtdText: row.ack_etd_text || null,
+    etdDate: toIso(row.etd_date),
+    siEtaDate: toIso(row.si_eta_date),
+    deliveryDate: toIso(row.delivery_date),
+    splitNo: row.split_no || 0,
+    splitFromId: row.split_from_id || null,
     nextDueDate: nextDue,
     currentPlannedDate: toIso(row.current_planned),
     etaDate: toIso(row.eta_date),
@@ -530,7 +702,7 @@ function buildFilters(sectionId, f) {
   if (f.q) {
     params.q = `%${`${f.q}`.trim().replace(/[%_[]/g, ch => `[${ch}]`)}%`;
     where.push(`(p.po_no LIKE @q OR p.supplier_name LIKE @q OR p.supplier_code LIKE @q OR s.short_name LIKE @q
-      OR p.shipment_ref LIKE @q OR p.remark LIKE @q
+      OR p.shipment_ref LIKE @q OR p.ack_no LIKE @q OR p.remark LIKE @q
       OR EXISTS (SELECT 1 FROM po_items i WHERE i.po_id = p.id AND (i.material_code LIKE @q OR i.short_text LIKE @q OR i.vendor_material LIKE @q)))`);
   }
   if (f.step) {
@@ -562,8 +734,8 @@ function buildFilters(sectionId, f) {
 const SORTS = {
   due: "CASE WHEN p.next_due_date IS NULL THEN 1 ELSE 0 END, p.next_due_date, p.po_no",
   eta: "CASE WHEN p.eta_date IS NULL THEN 1 ELSE 0 END, p.eta_date, p.po_no",
-  po: "p.po_no",
-  poDesc: "p.po_no DESC",
+  po: "p.po_no, p.split_no",
+  poDesc: "p.po_no DESC, p.split_no",
   docDate: "p.document_date DESC, p.po_no",
   supplier: "p.supplier_name, p.po_no",
   step: "p.current_step, p.next_due_date",
@@ -624,6 +796,8 @@ async function getPoDetail(poId, sectionId, ctx) {
     qtySku: num(i.qty_sku),
     skuUnit: i.sku_unit,
     leadTimeDays: i.lead_time_days,
+    ackQty: num(i.ack_qty),
+    siQty: num(i.si_qty),
     deleted: Boolean(i.deletion_indicator),
     stillToInvoiceQty: num(i.still_to_invoice_qty),
     stillToInvoiceValue: num(i.still_to_invoice_val),
@@ -681,6 +855,7 @@ module.exports = {
   addHistory,
   advancePo,
   buildFilters,
+  getShipment,
   cancelPo,
   createPo,
   deletePo,

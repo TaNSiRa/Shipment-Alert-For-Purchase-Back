@@ -17,7 +17,7 @@ const { wallTime } = require("../../services/serialize");
 const router = express.Router();
 router.use(resolveSection);
 
-const SCHEDULE_KEYS = ["workflow.dayMode", "workflow.useMaterialLeadTime", "workflow.defaultLeadTimeDays", "workflow.minFlexDays"];
+const SCHEDULE_KEYS = ["workflow.dayMode"];
 
 function audit(req, action, entityType, entityId, afterValue) {
   return writeAudit({

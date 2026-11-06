@@ -26,7 +26,7 @@ async function makePo(poNo, documentDate = addDays(todayIso(), -20), who = "buye
   const sup = (await api[who].get("/masters/lookup")).body.suppliers.find(s => s.supplierCode === "12200003");
   const lookup = (await api[who].get(`/masters/lookup?supplierId=${sup.id}`)).body.materials;
   const res = await api[who].post("/pos", {
-    poNo, supplierId: sup.id, documentDate, shipMode: "SEA",
+    poNo, supplierId: sup.id, documentDate, deliveryDate: addDays(documentDate, 75), shipMode: "SEA",
     items: [{ materialId: lookup[0].id, orderQty: 2, orderUnit: "CAN", netPrice: 100 }]
   });
   assert.equal(res.status, 201, JSON.stringify(res.body));
@@ -83,7 +83,13 @@ test("SAP export preview groups lines into POs and matches the masters", async (
 test("viewer cannot import; import commit creates POs once", async () => {
   const data = fileBase64(SAP_FILE);
   assert.equal((await api.viewer.post("/pos/import/commit", { data })).status, 403);
-  const res = await api.buyer.post("/pos/import/commit", { data, fileName: "DATA BY SAP.xlsx", poNos: ["1910000451", "1910000453"] });
+  const noDate = await api.buyer.post("/pos/import/commit", { data, fileName: "DATA BY SAP.xlsx", poNos: ["1910000451"] });
+  assert.equal(noDate.status, 400, "the Delivery date is required");
+  const res = await api.buyer.post("/pos/import/commit", {
+    data, fileName: "DATA BY SAP.xlsx", poNos: ["1910000451", "1910000453"],
+    deliveryDates: { 1910000451: "2026-07-15", 1910000453: "2026-06-30" },
+    modes: { 1910000453: "AIR" }
+  });
   assert.equal(res.status, 200, JSON.stringify(res.body));
   assert.equal(res.body.created.length, 2);
   const again = await api.buyer.post("/pos/import/preview", { data });
@@ -106,7 +112,12 @@ test("viewer cannot import; import commit creates POs once", async () => {
   assert.equal(list.body.total, 2);
   const po = list.body.data.find(p => p.poNo === "1910000453");
   assert.equal(po.currentStep, 2);
-  assert.equal(po.etaDate, addDays("2026-02-20", po.leadTimeDays));
+  assert.equal(po.deliveryDate, "2026-06-30");
+  assert.equal(po.etaDate, "2026-06-30", "step 7 is due on the Delivery date");
+  assert.equal(po.shipMode, "AIR", "Mode picked in the preview");
+  const po451 = list.body.data.find(p => p.poNo === "1910000451");
+  assert.equal(po451.shipMode, "SEA");
+  assert.equal(po451.deliveryDate, "2026-07-15", "each PO keeps its own Delivery date");
 });
 
 test("a stored SAP line is edited column by column; PO-wide columns stay locked", async () => {
@@ -203,10 +214,169 @@ test("re-import: changed cells of an existing PO are shown and applied only when
   assert.equal(batch.updated, 1);
 });
 
+// An OCR file as SAP writes it (Input 2 = Acknowledgement, Input 3 =
+// Shipping Instructions). rows: [{ doc, po, item, mat, qty, etd, eta }]
+async function ocrFile(category, rows) {
+  const buffer = await buildSheet({
+    sheetName: "Table",
+    columns: [
+      { header: "Category", key: "cat" },
+      { header: "Acknowledgment No. / Shipping Instruction No.", key: "doc" },
+      { header: "SAP PO No.", key: "po" },
+      { header: "SAP PO Item", key: "item" },
+      { header: "Ack/Ship Item", key: "line" },
+      { header: "SAP Material No.", key: "mat" },
+      { header: "Description", key: "desc" },
+      { header: "ETD (Descriptive)", key: "etd" },
+      { header: "ETA Date (Descriptive)", key: "eta" },
+      { header: "Ack or Ship. Quantity", key: "qty" },
+      { header: "Order Unit in PO", key: "unit" }
+    ],
+    rows: rows.map((r, i) => ({
+      cat: category, doc: r.doc, po: r.po, item: `${r.item}`.padStart(5, "0"), line: `${i + 1}`,
+      mat: `${r.mat || ""}`.padStart(18, "0"), desc: "TEST", etd: r.etd || "END OF MARCH 2026", eta: r.eta || "",
+      qty: Number(r.qty).toFixed(2), unit: "KAN"
+    }))
+  });
+  return Buffer.from(buffer).toString("base64");
+}
+
+test("OCR ACK moves POs to the S/I step, groups them by Acknowledgment No., splits a part shipment", async () => {
+  const id = (await api.viewer.get("/pos?q=1910000451")).body.data.find(p => p.poNo === "1910000451").id;
+  const po = (await api.viewer.get(`/pos/${id}`)).body.data;
+  assert.equal(po.currentStep, 2);
+  const live = po.items.filter(i => !i.deleted);
+  const first = live[0];
+  const half = first.orderQty / 2;
+  // ACK 001 alone: every line, the first one only half — nothing in the file
+  // makes up the other half, so the PO is blocked.
+  const ack1Rows = live.map((i, k) => ({
+    doc: "T-ACK-001", po: "1910000451", item: i.itemNo, mat: i.materialCode, qty: k === 0 ? half : i.orderQty
+  }));
+  const ack1Only = await ocrFile("Acknowledgement", ack1Rows);
+  const p0 = await api.buyer.post("/pos/import/preview", { data: ack1Only });
+  assert.equal(p0.status, 200, JSON.stringify(p0.body));
+  assert.equal(p0.body.rows[0].status, "ERROR");
+  assert.equal(p0.body.rows[0].selectable, false);
+  assert.equal(p0.body.rows[0].lines[0].state, "PARTIAL");
+  assert.ok(p0.body.rows[0].errors.some(e => /is missing/.test(e)), JSON.stringify(p0.body.rows[0].errors));
+  assert.equal((await api.buyer.post("/pos/import/commit", { kind: "ACK", data: ack1Only, keys: [p0.body.rows[0].key] })).status, 400);
+  // ACK 002 in the same file, but a quarter instead of the other half: still short.
+  const short = await ocrFile("Acknowledgement", [...ack1Rows,
+    { doc: "T-ACK-002", po: "1910000451", item: first.itemNo, mat: first.materialCode, qty: half / 2 }]);
+  const pShort = await api.buyer.post("/pos/import/preview", { data: short });
+  assert.ok(pShort.body.rows.every(r => r.status === "ERROR"), JSON.stringify(pShort.body.rows.map(r => r.status)));
+
+  // ACK 001 + ACK 002 (the other half of the first line) in one file: they add
+  // up to the PO -> the PO moves, and a copy of it holds ACK 002's line.
+  const ack1 = await ocrFile("Acknowledgement", [...ack1Rows,
+    { doc: "T-ACK-002", po: "1910000451", item: first.itemNo, mat: first.materialCode, qty: half }]);
+  const p1 = await api.buyer.post("/pos/import/preview", { data: ack1, fileName: "OCR ACK T-ACK-001.xlsx" });
+  assert.equal(p1.status, 200, JSON.stringify(p1.body));
+  assert.equal(p1.body.kind, "ACK");
+  assert.equal(p1.body.summary.ready, 1);
+  assert.equal(p1.body.summary.split, 1);
+  assert.equal(p1.body.shipments[0].docNo, "T-ACK-001");
+  const row1 = p1.body.rows[0];
+  const row2 = p1.body.rows[1];
+  assert.equal(row1.status, "READY", JSON.stringify(row1.errors));
+  assert.equal(row1.lines[0].state, "PARTIAL");
+  assert.ok(row1.warnings.some(w => /another Acknowledgment No/.test(w)));
+  assert.equal(row2.status, "SPLIT", JSON.stringify(row2));
+  assert.equal(row2.splitNo, 1);
+  assert.equal(row2.lines[0].state, "OK");
+  assert.equal((await api.viewer.post("/pos/import/commit", { kind: "ACK", data: ack1, keys: [row1.key] })).status, 403);
+  // An SI commit of an ACK file is refused.
+  assert.equal((await api.buyer.post("/pos/import/commit", { kind: "SI", data: ack1, keys: [row1.key] })).status, 400);
+  // Ticking only one of the two Acknowledgment Nos. leaves the PO short: refused.
+  assert.equal((await api.buyer.post("/pos/import/commit", { kind: "ACK", data: ack1, keys: [row1.key] })).status, 400);
+  const ackDate = addDays(todayIso(), -1);
+  const c1 = await api.buyer.post("/pos/import/commit", { kind: "ACK", data: ack1, fileName: "OCR ACK T-ACK-001.xlsx", keys: [row1.key, row2.key], actualDate: ackDate });
+  assert.equal(c1.status, 200, JSON.stringify(c1.body));
+  assert.equal(c1.body.moved.length, 1);
+  assert.equal(c1.body.created.length, 1);
+  const after1 = (await api.viewer.get(`/pos/${id}`)).body.data;
+  assert.equal(after1.currentStep, 3);
+  assert.equal(after1.ackNo, "T-ACK-001");
+  assert.equal(after1.ackEtdText, "END OF MARCH 2026");
+  assert.equal(after1.steps[1].actualDate, ackDate);
+  assert.equal(after1.steps[1].referenceNo, "T-ACK-001");
+  assert.equal(after1.items.find(i => i.id === first.id).ackQty, half);
+  assert.equal(after1.steps[2].dueDate, addDays(ackDate, 20));
+  // Same file again: already recorded.
+  const again = await api.buyer.post("/pos/import/preview", { data: ack1 });
+  assert.ok(again.body.rows.every(r => r.status === "ALREADY"));
+  assert.equal((await api.buyer.post("/pos/import/commit", { kind: "ACK", data: ack1, keys: [row1.key, row2.key] })).status, 400);
+
+  // ACK 002 made a copy of the PO with only that line.
+  const split = (await api.viewer.get(`/pos/${c1.body.created[0].id}`)).body.data;
+  assert.equal(split.poNo, "1910000451");
+  assert.equal(split.splitNo, 1);
+  assert.equal(split.splitFromId, id);
+  assert.equal(split.ackNo, "T-ACK-002");
+  assert.equal(split.currentStep, 3);
+  assert.equal(split.items.length, 1);
+  assert.equal(split.items[0].itemNo, first.itemNo);
+  assert.equal(split.items[0].ackQty, half);
+  assert.equal(split.items[0].orderQty, first.orderQty);
+  assert.equal(split.deliveryDate, after1.deliveryDate);
+  assert.equal(split.supplierCode, after1.supplierCode);
+  assert.equal(split.steps[1].actualDate, ackDate);
+  assert.ok((await api.viewer.get(`/pos/${id}`)).body.data.history.some(h => h.action === "SPLIT_CREATED"));
+  // Nothing is left of that line: a third ACK for it is refused.
+  const ack3 = await ocrFile("Acknowledgement", [{ doc: "T-ACK-003", po: "1910000451", item: first.itemNo, mat: first.materialCode, qty: 1 }]);
+  const p3 = await api.buyer.post("/pos/import/preview", { data: ack3 });
+  assert.equal(p3.body.rows[0].status, "ERROR");
+  // A PO that is not in the system.
+  const ghost = await ocrFile("Acknowledgement", [{ doc: "T-ACK-009", po: "9999999999", item: 10, mat: "1", qty: 1 }]);
+  assert.equal((await api.buyer.post("/pos/import/preview", { data: ghost })).body.rows[0].status, "NOT_FOUND");
+
+  // The pipeline counts shipments: two Acknowledgment Nos. at step 3.
+  const dash = (await api.viewer.get("/reports/dashboard")).body;
+  const s3 = dash.byStep.find(s => s.stepNo === 3);
+  assert.ok(s3.poCount >= 2 && s3.count >= 2);
+
+  // OCR SI: both shipments of the PO on one S/I — each record is moved, ETD/ETA kept.
+  const si = await ocrFile("Shipping Instructions", [
+    ...live.map((i, k) => ({ doc: "T-SI-01", po: "1910000451", item: i.itemNo, mat: i.materialCode, qty: k === 0 ? half : i.orderQty, etd: "2026-03-26", eta: "2026-04-04" })),
+    { doc: "T-SI-01", po: "1910000451", item: first.itemNo, mat: first.materialCode, qty: half, etd: "2026-03-26", eta: "2026-04-04" }
+  ]);
+  const ps = await api.buyer.post("/pos/import/preview", { data: si });
+  assert.equal(ps.status, 200, JSON.stringify(ps.body));
+  assert.equal(ps.body.kind, "SI");
+  assert.equal(ps.body.rows.length, 2, JSON.stringify(ps.body.rows.map(r => [r.status, r.warnings])));
+  assert.ok(ps.body.rows.every(r => r.status === "READY"), JSON.stringify(ps.body.rows.map(r => r.errors)));
+  assert.equal(ps.body.rows[0].etd, "2026-03-26");
+  assert.equal(ps.body.rows[0].eta, "2026-04-04");
+  const cs = await api.buyer.post("/pos/import/commit", { kind: "SI", data: si, keys: ps.body.rows.map(r => r.key) });
+  assert.equal(cs.status, 200, JSON.stringify(cs.body));
+  assert.equal(cs.body.moved.length, 2);
+  for (const pid of [id, split.id]) {
+    const x = (await api.viewer.get(`/pos/${pid}`)).body.data;
+    assert.equal(x.currentStep, 4);
+    assert.equal(x.shipmentRef, "T-SI-01");
+    assert.equal(x.etdDate, "2026-03-26");
+    assert.equal(x.siEtaDate, "2026-04-04");
+    assert.equal(x.etaDate, x.deliveryDate, "the S/I ETA does not move step 7");
+  }
+  // Undo the S/I step takes its data back.
+  assert.equal((await api.buyer.post(`/pos/${split.id}/undo`)).status, 200);
+  const undone = (await api.viewer.get(`/pos/${split.id}`)).body.data;
+  assert.equal(undone.currentStep, 3);
+  assert.equal(undone.etdDate, null);
+  assert.equal(undone.shipmentRef, null);
+  // Re-importing the DATA EXPORT compares against the PO itself, not the split copy.
+  const re = await api.buyer.post("/pos/import/preview", { data: fileBase64(SAP_FILE) });
+  assert.equal(re.body.pos.find(p => p.poNo === "1910000451").status, "EXISTS");
+  const batches = (await api.viewer.get("/pos/import/batches")).body.data;
+  assert.equal(batches[0].kind, "SI");
+});
+
 test("advance: validation, optimistic step check, re-plan from actual dates", async () => {
+
   const id = await makePo("T-ADV-1", addDays(todayIso(), -30));
   const before = (await api.buyer.get(`/pos/${id}`)).body.data;
-  assert.equal(before.steps.length, 9);
+  assert.equal(before.steps.length, 7);
   assert.equal(before.steps[0].state, "done");
   assert.equal(before.steps[1].state, "current");
 
@@ -215,16 +385,17 @@ test("advance: validation, optimistic step check, re-plan from actual dates", as
   assert.equal((await api.buyer.post(`/pos/${id}/advance`, { expectedStep: 3 })).status, 409);
   assert.equal((await api.viewer.post(`/pos/${id}/advance`, { expectedStep: 2 })).status, 403);
 
-  const lateAck = addDays(todayIso(), -2); // plan said -15
+  const lateAck = addDays(todayIso(), -2); // plan said -20 (N1+10)
   const ok = await api.buyer.post(`/pos/${id}/advance`, { expectedStep: 2, actualDate: lateAck, referenceNo: "141-02-W059" });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   const after = (await api.buyer.get(`/pos/${id}`)).body.data;
   assert.equal(after.currentStep, 3);
   assert.equal(after.steps[1].actualDate, lateAck);
   assert.equal(after.steps[1].referenceNo, "141-02-W059");
-  assert.equal(after.steps[1].lateDays, 13);
-  assert.equal(after.steps[2].dueDate, lateAck); // OCR ACK counts from the real ACK date
-  assert.ok(after.etaDate > before.etaDate, "a late ACK must push the ETA");
+  assert.equal(after.steps[1].lateDays, 18);
+  assert.equal(after.ackNo, "141-02-W059", "the ACK reference is the shipment's Acknowledgment No.");
+  assert.equal(after.steps[2].dueDate, addDays(lateAck, 20)); // S/I counts from the real ACK date
+  assert.equal(after.etaDate, before.etaDate, "step 7 stays on the Delivery date");
   assert.ok(after.history.some(h => h.action === "STEP_DONE" && h.stepNo === 2));
   // Double click on the same step is refused, not applied twice.
   assert.equal((await api.buyer.post(`/pos/${id}/advance`, { expectedStep: 2 })).status, 409);
@@ -253,23 +424,94 @@ test("bulk advance closes the same step on several POs and reports stale ones", 
   assert.equal(res.body.failed, 1);
 });
 
+test("past the S/I step a shipment (same ACK No.) moves together, once every PO of it is past the S/I step", async () => {
+  const start = addDays(todayIso(), -40);
+  const [a, b, c] = [await makePo("T-SHIP-A", start), await makePo("T-SHIP-B", start), await makePo("T-SHIP-C", start)];
+  const step = async (id, n, body = {}) => api.buyer.post(`/pos/${id}/advance`, { expectedStep: n, actualDate: addDays(start, n * 3), ...body });
+  for (const id of [a, b, c]) assert.equal((await step(id, 2, { referenceNo: "T-SHIP-ACK" })).status, 200);
+  // A and B through the S/I step; C still waits at step 3.
+  for (const id of [a, b]) assert.equal((await step(id, 3, { referenceNo: "T-SHIP-SI" })).status, 200);
+  const preview = (await api.viewer.get(`/pos/${a}/shipment`)).body.data;
+  assert.equal(preview.ackNo, "T-SHIP-ACK");
+  assert.equal(preview.together, true);
+  assert.deepEqual(preview.blockers.map(p => p.poNo), ["T-SHIP-C"]);
+  const blocked = await step(a, 4);
+  assert.equal(blocked.status, 400);
+  assert.match(JSON.stringify(blocked.body), /T-SHIP-C/);
+  assert.equal((await api.viewer.get(`/pos/${a}`)).body.data.currentStep, 4);
+  // C through the S/I step: step 4 on A now closes it on B and C too.
+  assert.equal((await step(c, 3, { referenceNo: "T-SHIP-SI" })).status, 200);
+  const moved = await step(a, 4, { remark: "docs in" });
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(moved.body.shipment, "T-SHIP-ACK");
+  assert.deepEqual(moved.body.withShipment.map(p => p.poNo).sort(), ["T-SHIP-B", "T-SHIP-C"]);
+  for (const id of [a, b, c]) {
+    const po = (await api.viewer.get(`/pos/${id}`)).body.data;
+    assert.equal(po.currentStep, 5);
+    assert.equal(po.steps[3].actualDate, addDays(start, 12));
+    assert.equal(po.steps[3].remark, "docs in");
+  }
+  // Bulk on the whole shipment: the first PO moves the others; they are
+  // reported as done with it, not as stale.
+  const bulk = await api.buyer.post("/pos/bulk-advance", { ids: [a, b, c], expectedStep: 5, actualDate: addDays(start, 15) });
+  assert.equal(bulk.status, 200, JSON.stringify(bulk.body));
+  assert.equal(bulk.body.done, 3);
+  assert.equal(bulk.body.failed, 0);
+  assert.equal(bulk.body.results[1].withShipmentOf, a);
+  for (const id of [a, b, c]) assert.equal((await api.viewer.get(`/pos/${id}`)).body.data.currentStep, 6);
+  // Undo on one PO reopens the step on the whole shipment.
+  assert.deepEqual((await api.viewer.get(`/pos/${b}/shipment`)).body.data.undoWith.map(p => p.poNo).sort(), ["T-SHIP-A", "T-SHIP-C"]);
+  assert.equal((await api.buyer2.post(`/pos/${b}/undo`)).status, 403);
+  const undone = await api.buyer.post(`/pos/${b}/undo`);
+  assert.equal(undone.status, 200, JSON.stringify(undone.body));
+  assert.equal(undone.body.stepNo, 5);
+  assert.deepEqual(undone.body.withShipment.map(p => p.poNo).sort(), ["T-SHIP-A", "T-SHIP-C"]);
+  for (const id of [a, b, c]) {
+    const po = (await api.viewer.get(`/pos/${id}`)).body.data;
+    assert.equal(po.currentStep, 5);
+    assert.equal(po.steps[4].actualDate, null);
+    assert.equal(po.steps[3].actualDate, addDays(start, 12), "only the last step is reopened");
+  }
+  // Undo of the S/I step stays per PO: the others keep their step.
+  const step4Undo = await api.buyer.post(`/pos/${a}/undo`);
+  assert.equal(step4Undo.status, 200);
+  assert.equal(step4Undo.body.withShipment.length, 2);
+  assert.deepEqual((await api.viewer.get(`/pos/${a}/shipment`)).body.data.undoWith, []);
+  const siUndo = await api.buyer.post(`/pos/${a}/undo`);
+  assert.equal(siUndo.status, 200);
+  assert.equal(siUndo.body.stepNo, 3);
+  assert.deepEqual(siUndo.body.withShipment, []);
+  assert.equal((await api.viewer.get(`/pos/${a}`)).body.data.currentStep, 3);
+  assert.equal((await api.viewer.get(`/pos/${b}`)).body.data.currentStep, 4);
+  // A PO without an Acknowledgment No. goes on its own.
+  const lone = await makePo("T-SHIP-LONE", start);
+  for (const n of [2, 3, 4]) assert.equal((await step(lone, n)).status, 200);
+  assert.equal((await api.viewer.get(`/pos/${lone}/shipment`)).body.data.together, false);
+});
+
 test("full run to completion, then dashboard and monthly report", async () => {
   const start = addDays(todayIso(), -60);
   const id = await makePo("T-FULL-1", start);
-  for (let step = 2; step <= 9; step += 1) {
+  for (let step = 2; step <= 7; step += 1) {
     const r = await api.buyer.post(`/pos/${id}/advance`, { expectedStep: step, actualDate: addDays(start, step * 5) });
     assert.equal(r.status, 200, `step ${step}: ${JSON.stringify(r.body)}`);
   }
   const po = (await api.buyer.get(`/pos/${id}`)).body.data;
   assert.equal(po.status, "COMPLETED");
-  assert.equal(po.currentStep, 10);
+  assert.equal(po.currentStep, 8);
   assert.equal((await api.buyer.post(`/pos/${id}/advance`, {})).status, 400);
 
   const dash = await api.viewer.get("/reports/dashboard");
   assert.equal(dash.status, 200);
   assert.ok(dash.body.counts.active >= 1);
-  assert.equal(dash.body.byStep.length, 8);
-  assert.equal(dash.body.trend.length, 6);
+  assert.equal(dash.body.byStep.length, 6);
+  assert.equal(dash.body.trend.length, 12);
+  assert.equal(dash.body.modesByMonth.length, 12);
+  assert.ok(Array.isArray(dash.body.bySupplier));
+  assert.equal((await api.viewer.get("/reports/dashboard/trend?year=2025")).body.trend[0].month, "2025-01");
+  const sup = (await api.viewer.get(`/reports/dashboard/suppliers?period=${todayIso().slice(0, 7)}`)).body;
+  assert.equal(sup.period, todayIso().slice(0, 7));
+  assert.ok(sup.suppliers.every(s => s.materials >= s.count));
   for (const t of dash.body.trend) {
     // Arrived on time / late are a part of what was planned for the month.
     assert.ok(t.plannedOnTime + t.plannedLate <= t.planned, JSON.stringify(t));
@@ -304,9 +546,18 @@ test("editing the PO date re-plans; only section admins may", async () => {
   const po = (await api.buyer.get(`/pos/${id}`)).body.data;
   assert.equal(po.documentDate, addDays(todayIso(), -12));
   assert.equal(po.leadTimeSource, "MANUAL");
-  assert.equal(po.etaDate, addDays(po.documentDate, 90));
+  assert.equal(po.etaDate, po.deliveryDate, "a Delivery date wins over the lead time");
   assert.equal(po.remark, "urgent");
   assert.equal(po.shipMode, "AIR");
+  // The Delivery date (step 7) can be changed by any editor, any time.
+  const d = addDays(todayIso(), 40);
+  assert.equal((await api.viewer.patch(`/pos/${id}`, { deliveryDate: d })).status, 403);
+  assert.equal((await api.buyer.patch(`/pos/${id}`, { deliveryDate: addDays(todayIso(), -30) })).status, 400);
+  assert.equal((await api.buyer.patch(`/pos/${id}`, { deliveryDate: d })).status, 200);
+  const moved = (await api.buyer.get(`/pos/${id}`)).body.data;
+  assert.equal(moved.deliveryDate, d);
+  assert.equal(moved.etaDate, d);
+  assert.equal(moved.steps[6].dueDate, d);
 });
 
 test("sections are isolated", async () => {
@@ -321,7 +572,7 @@ test("sections are isolated", async () => {
 test("duplicate and invalid manual POs are refused", async () => {
   await makePo("T-DUP-1");
   const sup = (await api.buyer.get("/masters/lookup")).body.suppliers[0];
-  assert.equal((await api.buyer.post("/pos", { poNo: "T-DUP-1", supplierId: sup.id, documentDate: todayIso(), items: [{ materialCode: "X" }] })).status, 409);
+  assert.equal((await api.buyer.post("/pos", { poNo: "T-DUP-1", supplierId: sup.id, documentDate: todayIso(), deliveryDate: addDays(todayIso(), 60), items: [{ materialCode: "X" }] })).status, 409);
   assert.equal((await api.buyer.post("/pos", { poNo: "T DUP; DROP", supplierId: sup.id, documentDate: todayIso(), items: [{ materialCode: "X" }] })).status, 400);
   assert.equal((await api.buyer.post("/pos", { poNo: "T-FUT", supplierId: sup.id, documentDate: addDays(todayIso(), 3), items: [{ materialCode: "X" }] })).status, 400);
   assert.equal((await api.buyer.post("/pos", { poNo: "T-NOITEM", supplierId: sup.id, documentDate: todayIso(), items: [] })).status, 400);
@@ -333,12 +584,12 @@ test("manual PO lines only take materials of the PO's supplier", async () => {
   const newfluo = sups.find(s => s.supplierCode === "11200024");
   const nihonMat = (await api.buyer.get(`/masters/lookup?supplierId=${nihon.id}`)).body.materials[0];
   const foreign = await api.buyer.post("/pos", {
-    poNo: "T-SUP-1", supplierId: newfluo.id, documentDate: todayIso(), items: [{ itemNo: "10", materialId: nihonMat.id }]
+    poNo: "T-SUP-1", supplierId: newfluo.id, documentDate: todayIso(), deliveryDate: addDays(todayIso(), 60), items: [{ itemNo: "10", materialId: nihonMat.id }]
   });
   assert.equal(foreign.status, 400, JSON.stringify(foreign.body));
   // 13000150 is under both suppliers; a typed code takes the PO supplier's row.
   const typed = await api.buyer.post("/pos", {
-    poNo: "T-SUP-2", supplierId: newfluo.id, documentDate: todayIso(), items: [{ materialCode: "13000150" }]
+    poNo: "T-SUP-2", supplierId: newfluo.id, documentDate: todayIso(), deliveryDate: addDays(todayIso(), 60), items: [{ materialCode: "13000150" }]
   });
   assert.equal(typed.status, 201, JSON.stringify(typed.body));
   const line = (await query(
@@ -370,13 +621,13 @@ test("masters: section admin edits, user cannot, referenced rows cannot be delet
 
 test("workflow edits are validated and re-plan open POs", async () => {
   const wf = (await api.viewer.get("/workflow")).body;
-  assert.equal(wf.steps.length, 9);
+  assert.equal(wf.steps.length, 7);
   const bad = wf.steps.map(s => (s.stepNo === 4 ? { ...s, anchorStepNo: 6 } : s));
   assert.equal((await api.secadmin.put("/workflow", { steps: bad })).status, 400);
   assert.equal((await api.buyer.put("/workflow", { steps: wf.steps })).status, 403);
   const id = await makePo("T-WF-1", addDays(todayIso(), -5));
   const before = (await api.buyer.get(`/pos/${id}`)).body.data;
-  const longerAck = wf.steps.map(s => (s.stepNo === 2 ? { ...s, offsetDays: 20 } : s));
+  const longerAck = wf.steps.map(s => (s.stepNo === 2 ? { ...s, offsetDays: s.offsetDays + 5 } : s));
   const r = await api.secadmin.put("/workflow", { steps: longerAck });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.ok(r.body.recalculated >= 1);
@@ -628,7 +879,8 @@ test("calendar, roadmap and list filters", async () => {
   assert.ok(Array.isArray(cal.body.events));
   const rm = await api.viewer.get("/pos/roadmap");
   assert.equal(rm.status, 200);
-  assert.ok(rm.body.data.every(p => p.steps.length === 9));
+  assert.ok(rm.body.data.every(p => p.steps.length === 7));
+
   const overdue = await api.viewer.get("/pos?due=OVERDUE&pageSize=500");
   assert.ok(overdue.body.data.every(p => p.dueState === "overdue"));
   const done = await api.viewer.get("/pos?status=COMPLETED");

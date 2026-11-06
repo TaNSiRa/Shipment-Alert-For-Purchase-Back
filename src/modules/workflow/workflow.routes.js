@@ -4,7 +4,7 @@ const { withTransaction } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { writeAudit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection } = require("../../services/sectionService");
-const { DEFAULT_STEPS, STEP_COUNT, flexOffsetFor, getWorkflow, validateWorkflow } = require("../../services/workflowService");
+const { DEFAULT_STEPS, STEP_COUNT, getWorkflow, validateWorkflow } = require("../../services/workflowService");
 const { getSectionSettings, scheduleSettings } = require("../../services/settingsService");
 const { recomputeSection } = require("../../services/poService");
 const { emitSection } = require("../../services/realtimeService");
@@ -14,11 +14,7 @@ router.use(resolveSection);
 
 router.get("/", asyncHandler(async (req, res) => {
   const [steps, settings] = await Promise.all([getWorkflow(req.section.id), getSectionSettings(req.section.id)]);
-  const sched = scheduleSettings(settings);
-  // A worked example for the page: what the flex step becomes at a few
-  // typical lead times from the material master.
-  const examples = [30, 60, 76, 120, 150].map(days => ({ leadTimeDays: days, flexDays: flexOffsetFor(steps, days, sched) }));
-  res.json({ steps, settings: sched, examples, defaults: DEFAULT_STEPS });
+  res.json({ steps, settings: scheduleSettings(settings), defaults: DEFAULT_STEPS });
 }));
 
 const stepSchema = z.object({
@@ -29,14 +25,16 @@ const stepSchema = z.object({
   anchorStepNo: z.number().int().min(1).max(9).nullable(),
   offsetDays: z.number().int().min(0).max(365),
   offsetMode: z.enum(["DAYS", "END_OF_MONTH"]),
-  isFlex: z.boolean(),
+  isFlex: z.boolean().optional(),
   isArrival: z.boolean(),
   referenceLabel: z.string().trim().max(80).optional().nullable()
 });
 
 router.put("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const { steps, recalculate } = z.object({ steps: z.array(stepSchema).length(STEP_COUNT), recalculate: z.boolean().default(true) }).parse(req.body);
-  const normalized = steps.map(s => (s.stepNo === 1 ? { ...s, anchorStepNo: null, offsetDays: 0, offsetMode: "DAYS", isFlex: false } : s));
+  const normalized = steps.map(s => (s.stepNo === 1
+    ? { ...s, anchorStepNo: null, offsetDays: 0, offsetMode: "DAYS", isFlex: false }
+    : { ...s, isFlex: false }));
   const problems = validateWorkflow(normalized);
   if (problems.length) return res.status(400).json({ message: problems[0], problems });
   await withTransaction(async tx => {

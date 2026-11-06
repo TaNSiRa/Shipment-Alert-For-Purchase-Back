@@ -159,7 +159,9 @@ async function loadMasters(sectionId, poNos) {
        FROM materials WHERE section_id = @sectionId AND is_active = 1 AND material_code IS NOT NULL`,
       { sectionId }
     ),
-    query("SELECT id, po_no FROM purchase_orders WHERE section_id = @sectionId", { sectionId })
+    // split_no 0 = the PO as imported; split copies (one per extra
+    // Acknowledgment No.) are not what a re-import compares against.
+    query("SELECT id, po_no FROM purchase_orders WHERE section_id = @sectionId AND split_no = 0", { sectionId })
   ]);
   const supplierByCode = new Map(suppliers.recordset.map(s => [`${s.supplier_code}`.trim(), s]));
   const materialsByCode = new Map();
@@ -211,7 +213,18 @@ function matchMaterial(materialsByCode, code, supplierId) {
 }
 
 // Groups lines into POs and checks each one. Nothing is written.
-async function analyze(sectionId, buffer, ctx) {
+//   opts.deliveryDates — { poNo: "YYYY-MM-DD" } picked per PO in the import
+//   preview: step 7's due date of each new PO. POs of one shipment share a
+//   date; POs that arrive apart each get their own.
+//   opts.deliveryDate — fallback for a new PO not named in deliveryDates.
+function deliveryResolver(opts = {}) {
+  const map = opts.deliveryDates || {};
+  const fallback = opts.deliveryDate || null;
+  return poNo => (Object.prototype.hasOwnProperty.call(map, poNo) && map[poNo]) || fallback;
+}
+
+async function analyze(sectionId, buffer, ctx, opts = {}) {
+  const deliveryOf = deliveryResolver(opts);
   const { lines, sheetName, headers, fields } = await readLines(buffer);
   const headersCount = headers.length;
   const today = todayIso();
@@ -292,7 +305,7 @@ async function analyze(sectionId, buffer, ctx) {
     const liveItems = items.filter(i => !i.deletionIndicator);
     const unmatched = liveItems.filter(i => i.match === "NONE");
     if (unmatched.length) {
-      warnings.push(`${unmatched.length} material(s) not in the Material Master (${unmatched.slice(0, 3).map(i => i.materialCode || "no code").join(", ")}${unmatched.length > 3 ? "…" : ""}) — lead time falls back`);
+      warnings.push(`${unmatched.length} material(s) not in the Material Master (${unmatched.slice(0, 3).map(i => i.materialCode || "no code").join(", ")}${unmatched.length > 3 ? "…" : ""})`);
     }
 
     const existing = masters.existingPos.get(poNo);
@@ -302,13 +315,21 @@ async function analyze(sectionId, buffer, ctx) {
       : resolveLeadTime(liveItems, ctx.sched);
     let etaDate = null;
     let nextDueDate = null;
+    let estimatedArrival = null;
+    const deliveryDate = existing ? null : deliveryOf(poNo);
+    if (documentDate && deliveryDate && !existing && deliveryDate < documentDate) {
+      errors.push(`Delivery date ${deliveryDate} is before the PO date (${documentDate})`);
+    }
     if (documentDate) {
       const due = computeSchedule({
         steps: ctx.steps, documentDate, leadTimeDays: lead.days, actuals: { 1: documentDate },
-        settings: ctx.sched, holidays: ctx.holidays
+        settings: ctx.sched, holidays: ctx.holidays, deliveryDate
       });
       etaDate = due[arrivalStepNo(ctx.steps)];
       nextDueDate = due[2];
+      estimatedArrival = computeSchedule({
+        steps: ctx.steps, documentDate, actuals: { 1: documentDate }, settings: ctx.sched, holidays: ctx.holidays
+      })[arrivalStepNo(ctx.steps)];
     }
     const header = {
       supplierCode,
@@ -352,13 +373,18 @@ async function analyze(sectionId, buffer, ctx) {
       status,
       existingId: existing?.id || null,
       existingStatus: existing?.status || null,
+      existingShipMode: existing?.ship_mode || null,
       changes,
       ...header,
       supplierShort: supplier?.short_name || null,
       supplierStatus,
       leadTimeDays: lead.days,
       leadTimeSource: lead.source,
+      deliveryDate,
       nextDueDate,
+      // What the workflow's own lead times give for step 7 when no Delivery
+      // date is set (N1+10 -> N2+20 -> N3+15 -> N4+5 -> +2).
+      estimatedArrival,
       etaDate,
       itemCount: liveItems.length,
       deletedCount,
@@ -387,9 +413,9 @@ async function analyze(sectionId, buffer, ctx) {
   return { summary, pos, fields, headers };
 }
 
-async function preview(sectionId, base64, ctx) {
+async function preview(sectionId, base64, ctx, opts = {}) {
   const buffer = decodeUpload(base64);
-  const { summary, pos } = await analyze(sectionId, buffer, ctx);
+  const { summary, pos } = await analyze(sectionId, buffer, ctx, opts);
   // The line pairing is only needed by commit.
   for (const p of pos) if (p.changes) delete p.changes.pairs;
   return { summary, pos };
@@ -632,16 +658,70 @@ async function applyChanges(tx, p, { sectionId, supplier, userId, batchId, fileN
 // between preview and commit) and, in one transaction (all of them or none),
 // creates the chosen new POs and applies the file to the chosen CHANGED ones.
 // A CHANGED PO is only touched when it is named in poNos.
-async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
+//   modes — { poNo: "SEA" | "AIR" | "TRUCK" | "COURIER" | "" } picked in the
+//   preview (per PO, or one value for all). A new PO is created with it; a PO
+//   already in the system that is otherwise unchanged gets only its Mode
+//   changed; a CHANGED PO takes it with the rest of the file's changes.
+async function commit(sectionId, { fileName, data, poNos, deliveryDate, deliveryDates, modes = {} }, user, ctx) {
   const buffer = decodeUpload(data);
-  const { summary, pos, fields, headers } = await analyze(sectionId, buffer, ctx);
+  const { summary, pos, fields, headers } = await analyze(sectionId, buffer, ctx, { deliveryDate, deliveryDates });
+  const modeOf = poNo => {
+    if (!Object.prototype.hasOwnProperty.call(modes || {}, poNo)) return undefined;
+    const m = `${modes[poNo] ?? ""}`.toUpperCase();
+    return ["SEA", "AIR", "TRUCK", "COURIER"].includes(m) ? m : null;
+  };
+  const modeChanges = [];
+  for (const p of pos) {
+    const mode = modeOf(p.poNo);
+    if (mode === undefined) continue;
+    if (p.status === "NEW") {
+      p.shipMode = mode;
+    } else if (p.status === "CHANGED") {
+      p.changes.po = p.changes.po.filter(c => c.field !== "shipMode");
+      if ((p.existingShipMode || null) !== mode) {
+        p.changes.po.push({ field: "shipMode", label: "Mode", from: p.existingShipMode || null, to: mode });
+      }
+    } else if (p.existingId && (p.existingShipMode || null) !== mode) {
+      modeChanges.push({ id: p.existingId, poNo: p.poNo, from: p.existingShipMode || null, to: mode });
+    }
+  }
   const wanted = new Set((poNos || []).map(p => `${p}`));
   const chosen = pos.filter(p => p.status === "NEW" && (!wanted.size || wanted.has(p.poNo)));
   const toUpdate = pos.filter(p => p.status === "CHANGED" && wanted.has(p.poNo));
+  if (!chosen.length && !toUpdate.length && modeChanges.length) {
+    // Only Modes picked for POs already in the system: no batch, no file kept.
+    const updated = await withTransaction(async tx => {
+      const out = [];
+      for (const c of modeChanges) {
+        const po = await lockPo(tx, c.id, sectionId);
+        await tx.query(
+          `UPDATE purchase_orders SET ship_mode = @mode, updated_by = @userId,
+             updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @id`,
+          { id: po.id, mode: c.to, userId: user.id }
+        );
+        await addHistory(tx, po.id, "EDITED", { actorId: user.id, detail: { shipMode: { from: c.from, to: c.to } } });
+        out.push({ id: po.id, poNo: c.poNo });
+      }
+      return out;
+    });
+    return { batchId: null, created: [], updated, suppliersAdded: 0, skipped: pos.length - updated.length, modesChanged: updated.length };
+  }
   if (!chosen.length && !toUpdate.length) {
     const err = new Error("Nothing to import — every selected PO is already in the system unchanged, or has errors");
     err.status = 400;
     throw err;
+  }
+  const noDate = chosen.filter(p => !p.deliveryDate);
+  if (noDate.length) {
+    const list = noDate.slice(0, 5).map(p => p.poNo).join(", ") + (noDate.length > 5 ? "…" : "");
+    throw httpError(400, `Choose the Delivery date of PO ${list} before importing — it is the due date of "Factory good received"`);
+  }
+  // A chosen PO whose Delivery date is before its PO date is an ERROR row
+  // and would be skipped without a word: refuse instead.
+  const badDate = pos.filter(p => p.status === "ERROR" && wanted.has(p.poNo) && !p.existingId
+    && p.deliveryDate && p.documentDate && p.deliveryDate < p.documentDate);
+  if (badDate.length) {
+    throw httpError(400, `The Delivery date of PO ${badDate.slice(0, 5).map(p => p.poNo).join(", ")} is before its PO date`);
   }
   const result = await withTransaction(async tx => {
     // Suppliers the master does not know yet are added from the file, so the
@@ -703,7 +783,8 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
           plant: p.plant,
           shipMode: p.shipMode,
           currency: p.currency,
-          remark: p.remark
+          remark: p.remark,
+          deliveryDate: p.deliveryDate
         },
         items: p.items
       }, ctx);
@@ -717,9 +798,19 @@ async function commit(sectionId, { fileName, data, poNos }, user, ctx) {
       }, ctx);
       updated.push({ id, poNo: p.poNo });
     }
-    return { batchId: batch.id, created, updated, suppliersAdded };
+    for (const c of modeChanges) {
+      await lockPo(tx, c.id, sectionId);
+      await tx.query(
+        `UPDATE purchase_orders SET ship_mode = @mode, updated_by = @userId,
+           updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @id`,
+        { id: c.id, mode: c.to, userId: user.id }
+      );
+      await addHistory(tx, c.id, "EDITED", { actorId: user.id, detail: { shipMode: { from: c.from, to: c.to } } });
+      updated.push({ id: c.id, poNo: c.poNo });
+    }
+    return { batchId: batch.id, created, updated, suppliersAdded, modesChanged: modeChanges.length };
   });
-  return { ...result, skipped: pos.length - chosen.length - toUpdate.length };
+  return { ...result, skipped: pos.length - chosen.length - toUpdate.length - modeChanges.length };
 }
 
 // ---------------------------------------------------------------------------

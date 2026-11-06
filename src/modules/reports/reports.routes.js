@@ -2,7 +2,9 @@ const express = require("express");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { resolveSection } = require("../../services/sectionService");
 const { loadContext } = require("../../services/poService");
-const { dashboardSummary, monthlyReport, monthlyReportBuffer } = require("../../services/reportService");
+const {
+  dashboardSummary, modesForYear, monthlyReport, monthlyReportBuffer, suppliersForPeriod, trendForYear, yearParam
+} = require("../../services/reportService");
 const { todayIso } = require("../../services/dates");
 
 const router = express.Router();
@@ -15,6 +17,20 @@ function monthParam(value) {
 router.get("/dashboard", asyncHandler(async (req, res) => {
   const ctx = await loadContext(req.section.id);
   res.json(await dashboardSummary(req.section.id, ctx));
+}));
+
+// The dashboard cards with their own year / period pickers reload alone.
+router.get("/dashboard/trend", asyncHandler(async (req, res) => {
+  const ctx = await loadContext(req.section.id);
+  res.json(await trendForYear(req.section.id, ctx, yearParam(req.query.year)));
+}));
+
+router.get("/dashboard/modes", asyncHandler(async (req, res) => {
+  res.json(await modesForYear(req.section.id, yearParam(req.query.year)));
+}));
+
+router.get("/dashboard/suppliers", asyncHandler(async (req, res) => {
+  res.json(await suppliersForPeriod(req.section.id, req.query.period));
 }));
 
 router.get("/monthly", asyncHandler(async (req, res) => {
